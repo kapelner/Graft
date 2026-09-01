@@ -5,6 +5,17 @@
 ### Added
 
 - feat: add Ruby language support (classes, modules, instance/singleton methods, visibility, mixin composition, attr_* and define_method synthesis)
+- feat: recognize Rails and RSpec macro vocabulary on top of Ruby extraction —
+  ActiveRecord associations/scopes/callbacks/`enum`/`delegate`/`attribute`/
+  `encrypts`/`has_secure_password`/`has_secure_token`/`accepts_nested_attributes_for`/
+  `store`/`store_accessor`/`has_one_attached`/`has_many_attached`/`delegated_type`,
+  ActionController callbacks/`rescue_from`/`helper_method`, `ActiveSupport::Concern`'s
+  `included`/`class_methods` blocks, the routing DSL (`get`/`post`/`resources`/
+  `namespace`/member-collection blocks), and RSpec's `describe`/`context`/`it`/
+  `let`/`subject`/`shared_examples`/`it_behaves_like` — each recognized macro
+  either synthesizes the real method(s) it generates at runtime or emits the
+  edge it wires up, grounded against the actual `rails/rails` source for every
+  method-generation shape rather than guessed
 - **C/C++ language support.** One `"cpp"` grammar (`tree-sitter-cpp`) parses the
   whole family — `.c/.h/.cpp/.hpp/.cc/.cxx/.hh/.hxx` — uniformly, the same
   approach clangd and most polyglot tooling take; there's no separate `.c`-only

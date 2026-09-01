@@ -868,6 +868,21 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         for (const s of rspecSynthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
         return;
       }
+      const sharedTarget = rspecSharedIncludeTarget(node);
+      if (sharedTarget) {
+        edges.push({ source: ctx.parentId, relation: "references", name: sharedTarget, file: ctx.rel });
+        // `it_behaves_like "..." do let(:x) { ... } end` — the optional block
+        // provides dependencies the shared group expects, walked under the
+        // SAME ctx (still the current describe/context group), not a new
+        // scope of its own — mirrors how a shared group's own methods
+        // attribute to it. Manually descended here (rather than relying on
+        // fallthrough) since this branch returns, matching every other
+        // node-or-edge-producing RSpec/Rails interception in this chain.
+        const block = node.childForFieldName("block");
+        const body = block?.namedChildren.find((c) => c.type === "body_statement" || c.type === "block_body");
+        if (body) for (const child of body.namedChildren) walk(child, ctx, out, edges, minted);
+        return;
+      }
     }
     // Rails: ActiveRecord/ActionController macros recognized as call shapes,
     // the same interception pattern as the plain-Ruby mixin/synthesized-method
@@ -2033,11 +2048,12 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
   return null;
 }
 
-const RSPEC_GROUP_KEYWORDS = new Set(["describe", "context"]);
+const RSPEC_GROUP_KEYWORDS = new Set(["describe", "context", "shared_examples", "shared_examples_for", "shared_context"]);
 const RSPEC_EXAMPLE_KEYWORDS = new Set(["it", "specify"]);
 
 /**
- * RSpec's `describe`/`context` blocks aren't inside any real Ruby class —
+ * RSpec's `describe`/`context`/`shared_examples`/`shared_examples_for`/
+ * `shared_context` blocks aren't inside any real Ruby class —
  * they're plain method calls whose block is the "body" — so this is the one
  * definition shape recognized from a `call` node rather than a real
  * class/module/def grammar construct. Recognized as `kind: "class"` (the
@@ -2846,6 +2862,33 @@ function isRspecHookCall(node: Parser.SyntaxNode): boolean {
   const methodNode = node.childForFieldName("method");
   if (methodNode?.type !== "identifier" || !RSPEC_HOOK_KEYWORDS.has(methodNode.text)) return false;
   return !node.childForFieldName("receiver");
+}
+
+const RSPEC_SHARED_INCLUDE_KEYWORDS = new Set([
+  "it_behaves_like",
+  "it_should_behave_like",
+  "include_examples",
+  "include_context",
+]);
+
+/**
+ * `it_behaves_like "a valid model"` / `it_should_behave_like` /
+ * `include_examples` / `include_context` — invokes a `shared_examples`/
+ * `shared_context` group defined elsewhere (possibly a different file), by
+ * name. Slugified the same way `describeRspec` names the group itself
+ * (`rspecSlug`), so the two sides always agree on the target name; resolved
+ * as a `references` edge (kind "class", same resolution path
+ * `railsAssociationTarget`'s `class_name:` edge already uses — this file's
+ * `.rb` branch in resolve.ts's references handling, not new logic).
+ */
+function rspecSharedIncludeTarget(node: Parser.SyntaxNode): string | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RSPEC_SHARED_INCLUDE_KEYWORDS.has(methodNode.text)) return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const strNode = args?.namedChildren.find((c) => c.type === "string");
+  const text = strNode?.namedChildren.find((c) => c.type === "string_content")?.text;
+  return text ? rspecSlug(text) : null;
 }
 
 /**
