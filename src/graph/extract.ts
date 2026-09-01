@@ -920,7 +920,37 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         for (const h of hasSecurePasswordCall) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
         return;
       }
-      const callbackTargets = railsCallbackTargets(node);
+      const attributeTargets = railsAttributeTargets(node);
+      if (attributeTargets.length > 0) {
+        for (const a of attributeTargets) emitRubySynthesizedMethod(a, ctx, out, edges, minted);
+        return;
+      }
+      const encryptsTargets = railsEncryptsTargets(node);
+      if (encryptsTargets.length > 0) {
+        for (const e of encryptsTargets) emitRubySynthesizedMethod(e, ctx, out, edges, minted);
+        return;
+      }
+      const delegatedTypeTargets = railsDelegatedTypeTargets(node);
+      if (delegatedTypeTargets.length > 0) {
+        for (const d of delegatedTypeTargets) emitRubySynthesizedMethod(d, ctx, out, edges, minted);
+        return;
+      }
+      const storeTargets = [...railsStoreAccessorTargets(node), ...railsStoreTargets(node)];
+      if (storeTargets.length > 0) {
+        for (const s of storeTargets) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        return;
+      }
+      const attachedTargets = railsAttachedTargets(node);
+      if (attachedTargets.length > 0) {
+        for (const a of attachedTargets) emitRubySynthesizedMethod(a, ctx, out, edges, minted);
+        return;
+      }
+      const secureTokenCall = railsHasSecureTokenTargets(node);
+      if (secureTokenCall.length > 0) {
+        for (const s of secureTokenCall) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        return;
+      }
+      const callbackTargets = [...railsCallbackTargets(node), ...railsHelperMethodTargets(node)];
       if (callbackTargets.length > 0) {
         for (const target of callbackTargets) {
           edges.push({ source: ctx.parentId, relation: "calls", name: target, viaMember: false, file: ctx.rel, kinds: ["method"] });
@@ -1007,15 +1037,18 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     node.type === "identifier" &&
     isRubyBareCallCandidate(node) &&
     ctx.enclosingClass !== null &&
-    node.text === "has_secure_password"
+    (node.text === "has_secure_password" || node.text === "has_secure_token")
   ) {
-    // `has_secure_password` with no explicit attribute/options is a bare,
-    // paren-less, argument-less call — parsed as a plain `identifier`, same
-    // as any other no-args invocation (see the branch below's own doc
-    // comment) — so it needs its own check here, ahead of the generic
-    // bare-call edge push, the same way the call-node form is intercepted
-    // above rather than falling through to an ordinary `calls` edge.
-    for (const h of railsHasSecurePasswordTargets(node)) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
+    // `has_secure_password`/`has_secure_token` with no explicit
+    // attribute/options is a bare, paren-less, argument-less call — parsed
+    // as a plain `identifier`, same as any other no-args invocation (see
+    // the branch below's own doc comment) — so it needs its own check
+    // here, ahead of the generic bare-call edge push, the same way the
+    // call-node form is intercepted above rather than falling through to
+    // an ordinary `calls` edge.
+    const targets =
+      node.text === "has_secure_password" ? railsHasSecurePasswordTargets(node) : railsHasSecureTokenTargets(node);
+    for (const h of targets) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
   } else if (ctx.lang === "ruby" && node.type === "identifier" && isRubyBareCallCandidate(node)) {
     // Ruby's optional parens mean a paren-less, argument-less method call
     // (`helper`) is syntactically indistinguishable from a local-variable
@@ -2462,6 +2495,225 @@ function railsHasSecurePasswordTargets(node: Parser.SyntaxNode): RubySynthesized
   const names = [`${attr}=`, `${attr}_confirmation=`, `authenticate_${attr}`];
   if (attr === RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR) names.push("authenticate");
   return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
+}
+
+/** `attribute :title, :string[, default: ...]` (`ActiveModel::Attributes` —
+ * both plain ActiveRecord models and virtual/form-object attributes) — a
+ * reader+writer pair for the FIRST symbol only (the second positional
+ * argument is the type, e.g. `:string`, not a second attribute name — unlike
+ * `encrypts`/`accepts_nested_attributes_for`'s multi-symbol shape below). */
+function railsAttributeTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "attribute") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return [];
+  const name = nameSym.text.slice(1);
+  return [
+    { name, hashNode: node, headerEnd: node.startIndex },
+    { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+  ];
+}
+
+/** `encrypts :ssn[, :name, :email, ...]` (`ActiveRecord::Encryption`) — a
+ * reader+writer pair per symbol; unlike `attribute`, every symbol argument
+ * names its own encrypted attribute (no "first is the name, rest are
+ * options" split — `deterministic:`/other options are always keyword pairs,
+ * never bare symbols, so filtering to `simple_symbol` alone is unambiguous). */
+function railsEncryptsTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "encrypts") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const names = (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  return names.flatMap((name) => [
+    { name, hashNode: node, headerEnd: node.startIndex },
+    { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+  ]);
+}
+
+/** `helper_method :current_user[, :logged_in?, ...]` (ActionController) —
+ * unlike every other macro above, this doesn't generate new methods; it
+ * exposes ALREADY-DEFINED controller methods to views. Modeled as a `calls`
+ * edge from the class to each named method (same shape as
+ * `railsCallbackTargets` — a declaration that wires up a real invocation at
+ * a later point, not a literal call at the declaration site), not a node
+ * synthesis. */
+function railsHelperMethodTargets(node: Parser.SyntaxNode): string[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "helper_method") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  return (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+}
+
+/** `Card` → `card`, `BlogPost` → `blog_post` — the inverse of `railsCamelize`,
+ * approximating Rails' own `String#underscore` (a simple regex, not a full
+ * reimplementation — an acronym-heavy name like `HTMLParser` won't split
+ * perfectly, but that's a rare enough shape that a wrong guess there is an
+ * acceptable cost against getting the common case right; see this file's
+ * usual "erring toward false negatives" precedent for where it draws the
+ * line differently — here a slightly-off name is judged lower-risk than no
+ * predicate method at all, since it doesn't corrupt anything, just names it
+ * imperfectly). */
+function railsUnderscore(camel: string): string {
+  return camel.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/**
+ * `delegated_type :billable, types: %w[Card Note][, primary_key: :uuid]`
+ * (`ActiveRecord::DelegatedType`) — internally calls `belongs_to role, ...,
+ * polymorphic: true` (confirmed directly against the Rails source, not
+ * assumed) plus its own additions, so this synthesizes the FULL set: the
+ * `<role>`/`<role>=` association pair (belongs_to's own contribution),
+ * `<role>_class`/`<role>_types` (fixed names), and one `<type>?` predicate
+ * per entry in the `types:` array — read from a `%w[...]` literal
+ * (`string_array`/`bare_string` node types, distinct from a `["..."]`
+ * double-quoted array, both handled here since either is valid Ruby for
+ * this argument).
+ */
+function railsDelegatedTypeTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "delegated_type") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const roleSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!roleSym) return [];
+  const role = roleSym.text.slice(1);
+  const typesPair = (args?.namedChildren ?? []).find((c) => c.type === "pair" && railsPairKey(c) === "types");
+  const typesValue = typesPair?.childForFieldName("value");
+  const stringContentOf = (n: Parser.SyntaxNode): string | undefined =>
+    n.namedChildren.find((c) => c.type === "string_content")?.text;
+  const typeNames: string[] =
+    typesValue?.type === "string_array"
+      ? typesValue.namedChildren
+          .filter((c) => c.type === "bare_string")
+          .map(stringContentOf)
+          .filter((v): v is string => v !== undefined)
+      : typesValue?.type === "array"
+        ? typesValue.namedChildren
+            .filter((c) => c.type === "string")
+            .map(stringContentOf)
+            .filter((v): v is string => v !== undefined)
+        : [];
+  const names = [role, `${role}=`, `${role}_class`, `${role}_types`, ...typeNames.map((t) => `${railsUnderscore(t)}?`)];
+  return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
+}
+
+/** Rails' own prefix/suffix naming for `store_accessor`/`store`-generated
+ * methods: `true` uses the store attribute's own name, a string/symbol
+ * value is used literally, anything else contributes nothing — confirmed
+ * directly against the Rails source (activerecord/lib/active_record/store.rb),
+ * not assumed. */
+function railsStoreAffix(
+  pairValue: Parser.SyntaxNode | null | undefined,
+  storeAttr: string,
+  side: "prefix" | "suffix",
+): string {
+  let v: string | null = null;
+  if (pairValue?.type === "true") v = storeAttr;
+  else if (pairValue?.type === "simple_symbol") v = pairValue.text.slice(1);
+  else if (pairValue?.type === "string") v = railsStringLiteralValue(pairValue);
+  if (!v) return "";
+  return side === "prefix" ? `${v}_` : `_${v}`;
+}
+
+/** `store_accessor :settings, :color, :size[, prefix:, suffix:]` — the
+ * FIRST symbol is the store attribute itself (skipped, not an accessor
+ * key), every symbol after it is a `<prefix><key><suffix>`/`=` reader+
+ * writer pair. */
+function railsStoreAccessorTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "store_accessor") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  if (!args) return [];
+  const symbols = args.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  const [storeAttr, ...keys] = symbols;
+  if (!storeAttr || keys.length === 0) return [];
+  const pairs = args.namedChildren.filter((c) => c.type === "pair");
+  const prefix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "prefix")?.childForFieldName("value"), storeAttr, "prefix");
+  const suffix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "suffix")?.childForFieldName("value"), storeAttr, "suffix");
+  return keys.flatMap((key) => {
+    const name = `${prefix}${key}${suffix}`;
+    return [
+      { name, hashNode: node, headerEnd: node.startIndex },
+      { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+    ];
+  });
+}
+
+/** `store :settings, accessors: [:color, :size][, prefix:, suffix:]` —
+ * internally calls `store_accessor` with the same `accessors:`/`prefix:`/
+ * `suffix:` options (confirmed directly against the Rails source), so this
+ * reads the exact same shape from an `accessors:` array instead of trailing
+ * positional symbols. No `accessors:` option means `store` only serializes
+ * the column, generating no per-key methods — correctly returns []. */
+function railsStoreTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "store") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const storeAttrSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!storeAttrSym) return [];
+  const storeAttr = storeAttrSym.text.slice(1);
+  const pairs = (args?.namedChildren ?? []).filter((c) => c.type === "pair");
+  const accessorsValue = pairs.find((c) => railsPairKey(c) === "accessors")?.childForFieldName("value");
+  if (accessorsValue?.type !== "array") return [];
+  const keys = accessorsValue.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  const prefix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "prefix")?.childForFieldName("value"), storeAttr, "prefix");
+  const suffix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "suffix")?.childForFieldName("value"), storeAttr, "suffix");
+  return keys.flatMap((key) => {
+    const name = `${prefix}${key}${suffix}`;
+    return [
+      { name, hashNode: node, headerEnd: node.startIndex },
+      { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+    ];
+  });
+}
+
+const RAILS_ATTACHED_KEYWORDS = new Set(["has_one_attached", "has_many_attached"]);
+
+/** `has_one_attached :avatar` / `has_many_attached :photos[, dependent:
+ * ...]` (`ActiveStorage`) — a reader+writer pair, same shape as
+ * `railsAttachedTargets`'s siblings; the singular/plural distinction (one
+ * attachment vs. a collection) doesn't change which methods are generated,
+ * only their runtime behavior. */
+function railsAttachedTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_ATTACHED_KEYWORDS.has(methodNode.text)) return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return [];
+  const name = nameSym.text.slice(1);
+  return [
+    { name, hashNode: node, headerEnd: node.startIndex },
+    { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+  ];
+}
+
+const RAILS_SECURE_TOKEN_DEFAULT_ATTR = "token";
+
+/** `has_secure_token` (bare, no parens — default `:token` attribute, same
+ * dual node-type handling as `railsHasSecurePasswordTargets`) or
+ * `has_secure_token(:attr[, length:, on:, prefix:])` — a single
+ * `regenerate_<attr>` method (confirmed directly against the Rails source:
+ * unlike `has_secure_password`, this macro defines only one new method). */
+function railsHasSecureTokenTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  let attr = RAILS_SECURE_TOKEN_DEFAULT_ATTR;
+  if (node.type === "call") {
+    const methodNode = node.childForFieldName("method");
+    if (methodNode?.type !== "identifier" || methodNode.text !== "has_secure_token") return [];
+    if (node.childForFieldName("receiver")) return [];
+    const args = node.childForFieldName("arguments");
+    const attrSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+    if (attrSym) attr = attrSym.text.slice(1);
+  } else if (node.type !== "identifier" || node.text !== "has_secure_token") {
+    return [];
+  }
+  return [{ name: `regenerate_${attr}`, hashNode: node, headerEnd: node.startIndex }];
 }
 
 const RAILS_CALLBACK_KEYWORDS = new Set([
