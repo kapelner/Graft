@@ -2484,7 +2484,67 @@ function railsResourcesTargets(node: Parser.SyntaxNode): { controller: string; a
   const except = symbolsOf(pairs.find((c) => railsPairKey(c) === "except"));
   let actions = only ?? defaultActions;
   if (except) actions = actions.filter((a) => !except.includes(a));
+  // member/collection routes are additive custom actions, unaffected by
+  // only:/except: (those narrow only the 7/6 CONVENTIONAL CRUD actions).
+  actions = [...actions, ...railsResourcesBlockActions(node)];
   return actions.map((action) => ({ controller, action }));
+}
+
+/** The verb calls (`get :publish`, `post :archive`, ...) directly inside a
+ * `member do ... end` / `collection do ... end` block — the symbol is the
+ * action name itself, not a path (contrast top-level routes, where `get`'s
+ * first argument is always a path string). */
+function railsMemberCollectionActionSymbols(doBlockBody: Parser.SyntaxNode): string[] {
+  const actions: string[] = [];
+  for (const child of doBlockBody.namedChildren) {
+    if (child.type !== "call") continue;
+    const methodNode = child.childForFieldName("method");
+    if (methodNode?.type !== "identifier" || !RAILS_ROUTE_VERBS.has(methodNode.text)) continue;
+    const args = child.childForFieldName("arguments");
+    const actionSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+    if (actionSym) actions.push(actionSym.text.slice(1));
+  }
+  return actions;
+}
+
+/**
+ * `resources :posts do member do ... end; collection do ... end end` and the
+ * inline `get :publish, on: :member` form — both name additional actions on
+ * the SAME controller the enclosing `resources` already resolved: member/
+ * collection only affect the generated PATH (`/posts/:id/publish` vs.
+ * `/posts/search`), never which controller handles it, so both forms are
+ * read identically here. A nested `resources` inside this block (genuinely
+ * nested routes, e.g. `resources :posts do resources :comments end`) is
+ * deliberately unhandled — a different controller entirely, out of scope
+ * for this pass, same "erring toward false negatives" precedent as
+ * elsewhere in this file.
+ */
+function railsResourcesBlockActions(node: Parser.SyntaxNode): string[] {
+  const block = node.childForFieldName("block");
+  const body = block?.namedChildren.find((c) => c.type === "body_statement");
+  if (!body) return [];
+  const actions: string[] = [];
+  for (const child of body.namedChildren) {
+    if (child.type !== "call") continue;
+    const methodNode = child.childForFieldName("method");
+    if (methodNode?.type !== "identifier") continue;
+    if (methodNode.text === "member" || methodNode.text === "collection") {
+      const innerBlock = child.childForFieldName("block");
+      const innerBody = innerBlock?.namedChildren.find((c) => c.type === "body_statement");
+      if (innerBody) actions.push(...railsMemberCollectionActionSymbols(innerBody));
+      continue;
+    }
+    if (RAILS_ROUTE_VERBS.has(methodNode.text)) {
+      const args = child.childForFieldName("arguments");
+      const onPair = args?.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "on");
+      const onValue = railsPairSymbolValue(onPair);
+      if (onValue === "member" || onValue === "collection") {
+        const actionSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+        if (actionSym) actions.push(actionSym.text.slice(1));
+      }
+    }
+  }
+  return actions;
 }
 
 /**

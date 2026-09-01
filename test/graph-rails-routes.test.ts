@@ -136,6 +136,62 @@ end
   assert.equal(call?.name, "index");
 });
 
+test("rails routes: resources member/collection do...end blocks add actions on the same controller", () => {
+  const src = `
+Rails.application.routes.draw do
+  resources :posts do
+    member do
+      get :publish
+      post :archive
+    end
+    collection do
+      get :search
+    end
+  end
+end
+`;
+  const { rawEdges } = extractFile("routes.rb", src, "ruby");
+  const targets = rawEdges.filter((e) => e.relation === "calls").map((e) => `${e.recvType}#${e.name}`);
+  for (const action of ["publish", "archive", "search"]) {
+    assert.ok(targets.includes(`PostsController#${action}`), action);
+  }
+  // still has the 7 conventional actions too
+  assert.ok(targets.includes("PostsController#index"));
+});
+
+test("rails routes: the inline get :action, on: :member/:collection form is recognized too", () => {
+  const src = `
+Rails.application.routes.draw do
+  resources :widgets, only: [:show] do
+    get :export, on: :collection
+    post :duplicate, on: :member
+  end
+end
+`;
+  const { rawEdges } = extractFile("routes.rb", src, "ruby");
+  const targets = rawEdges.filter((e) => e.relation === "calls").map((e) => `${e.recvType}#${e.name}`);
+  assert.deepEqual(
+    targets.sort(),
+    ["WidgetsController#duplicate", "WidgetsController#export", "WidgetsController#show"].sort(),
+  );
+});
+
+test("rails routes: a nested resources inside the block is not misread as a member/collection action", () => {
+  const src = `
+Rails.application.routes.draw do
+  resources :posts do
+    resources :comments
+  end
+end
+`;
+  const { rawEdges } = extractFile("routes.rb", src, "ruby");
+  const targets = rawEdges.filter((e) => e.relation === "calls").map((e) => `${e.recvType}#${e.name}`);
+  // Posts gets only its 7 conventional actions -- nested `resources :comments`
+  // is a different controller entirely and deliberately unhandled here.
+  assert.equal(targets.filter((t) => t.startsWith("PostsController#")).length, 7);
+  assert.equal(targets.some((t) => t.startsWith("CommentsController#")), false);
+});
+
 test("rails routes: unrelated do-block calls outside .routes.draw are untouched", () => {
   const src = `
 class Widget
