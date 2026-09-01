@@ -836,6 +836,20 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // find its public=/private=/active= arguments (there's no other path to
     // them), and it must not ALSO be treated as an ordinary call to a
     // function literally named "R6Class"/"list".
+    // Rails routing DSL: `<expr>.routes.draw do ... end` (Rails.application.routes
+    // or a Rails::Engine subclass's own `.routes`) sits at file top level, never
+    // inside a class — so this check is independent of ctx.enclosingClass, unlike
+    // every other Ruby/Rails interception below. Its content is walked by a
+    // dedicated recursive pass (not the general-purpose `walk()`): a route
+    // declaration isn't a Ruby definition to extract, it's DSL metadata pointing
+    // at a controller#action pair, so no node synthesis applies, only edges. See
+    // walkRailsRoutes's own doc comment for scope and the resolution mechanism.
+    if (ctx.lang === "ruby" && isRailsRoutesDrawCall(node)) {
+      const block = node.childForFieldName("block");
+      const body = block?.namedChildren.find((c) => c.type === "body_statement");
+      if (body) walkRailsRoutes(body, ctx, edges);
+      return;
+    }
     const rubyMixins = ctx.lang === "ruby" && ctx.enclosingClass !== null ? rubyMixinTargets(node) : [];
     if (rubyMixins.length > 0) {
       for (const target of rubyMixins) {
@@ -2353,6 +2367,164 @@ function isRailsSuppressedMacro(node: Parser.SyntaxNode): boolean {
   if (node.childForFieldName("receiver")) return false;
   const name = methodNode.text;
   return name === "validates" || name.startsWith("validates_") || RAILS_SUPPRESSED_MACROS.has(name);
+}
+
+/**
+ * `<expr>.routes.draw do ... end` — recognized structurally (the immediate
+ * receiver of `draw` is itself a `.routes` call), not by matching literally
+ * "Rails.application" — this also covers a `Rails::Engine` subclass's own
+ * `SomeEngine::Engine.routes.draw`, the same shape with a different receiver
+ * chain underneath `.routes`.
+ */
+function isRailsRoutesDrawCall(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "draw") return false;
+  const receiver = node.childForFieldName("receiver");
+  if (receiver?.type !== "call") return false;
+  return receiver.childForFieldName("method")?.text === "routes";
+}
+
+/** `"controller#action"` (or namespaced `"admin/users#index"`, `/`-separated
+ * module segments) → `{ controller: "Admin::UsersController", action: "index" }`.
+ * Null if there's no `#`, or either half is empty. */
+function railsControllerActionFromString(text: string): { controller: string; action: string } | null {
+  const hashIdx = text.indexOf("#");
+  if (hashIdx === -1) return null;
+  const controllerPart = text.slice(0, hashIdx);
+  const action = text.slice(hashIdx + 1);
+  if (!controllerPart || !action) return null;
+  const segments = controllerPart.split("/").filter(Boolean);
+  if (segments.length === 0) return null;
+  const controller = segments
+    .map((s, i) => (i === segments.length - 1 ? `${railsCamelize(s)}Controller` : railsCamelize(s)))
+    .join("::");
+  return { controller, action };
+}
+
+/** `posts` → `Posts`, `blog_posts` → `BlogPosts` — Rails' own deterministic
+ * naming convention (a plural/singular symbol camelized verbatim, NO
+ * singularization guessing), the same reasoning `railsAssociationTarget`'s
+ * doc comment explains for why singularizing `:categories` isn't attempted. */
+function railsCamelize(snakeCase: string): string {
+  return snakeCase
+    .split("_")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join("");
+}
+
+function railsStringLiteralValue(node: Parser.SyntaxNode | null | undefined): string | null {
+  if (node?.type !== "string") return null;
+  return node.namedChildren.find((c) => c.type === "string_content")?.text ?? null;
+}
+
+const RAILS_ROUTE_VERBS = new Set(["get", "post", "put", "patch", "delete"]);
+
+/**
+ * `get/post/put/patch/delete "/path", to: "controller#action"` and
+ * `root "controller#action"` / `root to: "controller#action"`. A verb's
+ * target is read ONLY from an explicit `to:` pair — a bare positional string
+ * is always the path (position 0), never the target, so it's never
+ * mistaken for one. `root` is the one exception: a single positional string
+ * with no `to:` at all IS the target (root's own path is always implicit
+ * "/", so there's no path argument to collide with).
+ */
+function railsRouteTarget(node: Parser.SyntaxNode): { controller: string; action: string } | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return null;
+  if (node.childForFieldName("receiver")) return null;
+  const isRoot = methodNode.text === "root";
+  if (!RAILS_ROUTE_VERBS.has(methodNode.text) && !isRoot) return null;
+  const args = node.childForFieldName("arguments");
+  if (!args) return null;
+  const toPair = args.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "to");
+  const toText = railsStringLiteralValue(toPair?.childForFieldName("value"));
+  if (toText) return railsControllerActionFromString(toText);
+  if (isRoot) {
+    const bareText = railsStringLiteralValue(args.namedChildren.find((c) => c.type === "string"));
+    if (bareText) return railsControllerActionFromString(bareText);
+  }
+  return null;
+}
+
+const RAILS_RESOURCES_DEFAULT_ACTIONS = ["index", "create", "new", "edit", "show", "update", "destroy"];
+const RAILS_RESOURCE_SINGULAR_DEFAULT_ACTIONS = ["create", "new", "edit", "show", "update", "destroy"];
+
+/**
+ * `resources :posts[, only:/except:/controller: ...]` (plural, RESTful
+ * collection — no `index` for the singular `resource` form, which has no
+ * collection to list). `only:`/`except:` narrow the 7/6 conventional
+ * actions, each taking either a bare symbol or a symbol array. `controller:`
+ * overrides which symbol names the controller, still camelized the same
+ * deterministic way. Nested `do ... end` blocks (`member`/`collection`
+ * sub-routes) are deliberately unhandled — out of scope for this pass, see
+ * the design note in the Rails routing test file.
+ */
+function railsResourcesTargets(node: Parser.SyntaxNode): { controller: string; action: string }[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || (methodNode.text !== "resources" && methodNode.text !== "resource")) return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return [];
+  const pairs = (args?.namedChildren ?? []).filter((c) => c.type === "pair");
+  const controllerOverride = railsStringLiteralValue(
+    pairs.find((c) => railsPairKey(c) === "controller")?.childForFieldName("value"),
+  );
+  const controller = `${railsCamelize(controllerOverride ?? nameSym.text.slice(1))}Controller`;
+  const defaultActions =
+    methodNode.text === "resources" ? RAILS_RESOURCES_DEFAULT_ACTIONS : RAILS_RESOURCE_SINGULAR_DEFAULT_ACTIONS;
+  const symbolsOf = (pair: Parser.SyntaxNode | undefined): string[] | null => {
+    const value = pair?.childForFieldName("value");
+    if (value?.type === "simple_symbol") return [value.text.slice(1)];
+    if (value?.type === "array") return value.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+    return null;
+  };
+  const only = symbolsOf(pairs.find((c) => railsPairKey(c) === "only"));
+  const except = symbolsOf(pairs.find((c) => railsPairKey(c) === "except"));
+  let actions = only ?? defaultActions;
+  if (except) actions = actions.filter((a) => !except.includes(a));
+  return actions.map((action) => ({ controller, action }));
+}
+
+/**
+ * Recursive descent over a routes-DSL body (the `draw do...end` block's own
+ * body_statement, or a nested `namespace do...end`'s) — NOT `walk()`, since
+ * nothing here is a Ruby definition to extract, only edges pointing at
+ * controller actions. `namespace :admin do ... end` is recursed into so its
+ * nested routes are still reached, but deliberately does NOT qualify the
+ * resolved controller name (`Admin::UsersController`) — `NodeV1.owner` (what
+ * `resolveTypedMember` actually keys `recvType` lookups against) is always a
+ * class's bare name, never namespace-qualified, even for a class nested in a
+ * module; a qualified `recvType` would silently never match anything. Every
+ * recognized route (verb/root/resources) becomes a `calls` edge shaped
+ * exactly like a typed member call (`viaMember: true, recvType:
+ * "<Controller>"`) — reusing resolve.ts's existing typed-member resolution
+ * (the same path `self.method`/`Klass.method` dispatch already goes through)
+ * rather than inventing route-specific resolution logic; if two same-named
+ * controllers exist in different namespaces/files, resolveTypedMember's
+ * existing same-file-tiebreak-else-ambiguous-drop rule applies, same as any
+ * other typed call. `source` is `ctx.parentId`, which at file top level
+ * (routes.rb has no enclosing class) is the file's own node id.
+ */
+function walkRailsRoutes(node: Parser.SyntaxNode, ctx: WalkCtx, edges: RawEdge[]): void {
+  for (const child of node.namedChildren) {
+    if (child.type !== "call") continue;
+    const methodNode = child.childForFieldName("method");
+    if (methodNode?.type === "identifier" && methodNode.text === "namespace" && !child.childForFieldName("receiver")) {
+      const block = child.childForFieldName("block");
+      const body = block?.namedChildren.find((c) => c.type === "body_statement");
+      if (body) walkRailsRoutes(body, ctx, edges);
+      continue;
+    }
+    const targets: { controller: string; action: string }[] = [];
+    const route = railsRouteTarget(child);
+    if (route) targets.push(route);
+    targets.push(...railsResourcesTargets(child));
+    for (const t of targets) {
+      edges.push({ source: ctx.parentId, relation: "calls", name: t.action, viaMember: true, recvType: t.controller, file: ctx.rel });
+    }
+  }
 }
 
 /**
