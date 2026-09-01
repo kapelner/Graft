@@ -903,7 +903,17 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
     const isConsumedRClassCall =
       consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
-    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
+    // `included do ... end` / `class_methods do ... end` — unlike every other
+    // interception above, this one does NOT return early: the do_block's
+    // content (macros, defs) is already reached correctly by the ordinary
+    // trailing recursion below, with ctx.enclosingClass unchanged (still the
+    // concern module) — verified directly, not assumed (see
+    // test/graph-rails-concern.test.ts). Only the callee computation is
+    // suppressed, so the hook call itself doesn't become a spurious `calls`
+    // edge — plausible, not just theoretical, since `def self.included(base)`
+    // is itself a common Ruby override a real codebase might define.
+    const isRubyConcernHook = ctx.lang === "ruby" && isRailsConcernHookCall(node);
+    const callee = isConsumedRClassCall || isRubyConcernHook ? null : calleeName(node, ctx.lang);
     if (callee) {
       const callEdge: RawEdge = {
         source: ctx.parentId,
@@ -2318,6 +2328,25 @@ const RAILS_SUPPRESSED_MACROS = new Set(["queue_as", "retry_on", "discard_on"]);
  * and `queue_as`'s queue-name symbol don't reference anything callable
  * either — there's no node or edge here that wouldn't be a guess.
  */
+const RAILS_CONCERN_HOOKS = new Set(["included", "class_methods"]);
+
+/**
+ * `included do ... end` / `class_methods do ... end` — `ActiveSupport::Concern`'s
+ * own hook calls: a bare identifier with no `argument_list` at all (just a
+ * name + a `do_block`), distinguishing them from every other zero-arg call
+ * shape this file recognizes. Only the hook call ITSELF is suppressed here —
+ * unlike this file's other suppression/interception checks, the caller does
+ * NOT return early for this one, since the do_block's content needs the
+ * ordinary trailing recursion to reach it. See the call site's comment for
+ * why no return is correct here specifically.
+ */
+function isRailsConcernHookCall(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_CONCERN_HOOKS.has(methodNode.text)) return false;
+  if (node.childForFieldName("receiver")) return false;
+  return !node.childForFieldName("arguments");
+}
+
 function isRailsSuppressedMacro(node: Parser.SyntaxNode): boolean {
   const methodNode = node.childForFieldName("method");
   if (methodNode?.type !== "identifier") return false;
