@@ -205,3 +205,48 @@ end
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("ruby Phase 1: a bare statement-position call inside a curly-brace { } block resolves too", async () => {
+  const src = `
+def helper
+  1
+end
+
+def caller
+  -> { helper }
+end
+`;
+  const { dir, graph } = await buildAndRead({ "widget.rb": src });
+  try {
+    assert.ok(
+      graph.edges.some((e) => e.relation === "calls" && e.source === "widget.rb#caller" && e.target === "widget.rb#helper"),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ruby Phase 1: an assignment RHS inside a curly-brace { } block is not a call candidate", async () => {
+  // Mirrors the body_statement negative test above, for block_body: `name`
+  // exists as a real top-level function, so a false-positive edge from
+  // `x = name` inside the lambda would actually resolve to it.
+  const src = `
+def name
+  "shadow"
+end
+
+def caller(name)
+  -> { x = name; x }
+end
+`;
+  const { dir, graph } = await buildAndRead({ "widget.rb": src });
+  try {
+    assert.equal(
+      graph.edges.some((e) => e.relation === "calls" && e.target === "widget.rb#name"),
+      false,
+      "a bare identifier on an assignment's right-hand side, inside a { } block, must not be treated as a call",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

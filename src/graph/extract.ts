@@ -863,6 +863,11 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         for (const s of synthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
         return;
       }
+      const rspecSynthesized = rspecSynthesizedMethods(node);
+      if (rspecSynthesized.length > 0) {
+        for (const s of rspecSynthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        return;
+      }
     }
     // Rails: ActiveRecord/ActionController macros recognized as call shapes,
     // the same interception pattern as the plain-Ruby mixin/synthesized-method
@@ -926,7 +931,13 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // suppressed, so the hook call itself doesn't become a spurious `calls`
     // edge — plausible, not just theoretical, since `def self.included(base)`
     // is itself a common Ruby override a real codebase might define.
-    const isRubyConcernHook = ctx.lang === "ruby" && isRailsConcernHookCall(node);
+    // RSpec's before/after/around do...end hooks are the same shape as the
+    // Concern hooks above (a call whose only payload is its block — no name
+    // to reference elsewhere, so no node synthesized) — suppressed the same
+    // way, without an early return, so the hook body still reaches the
+    // ordinary trailing recursion (with ctx.enclosingClass already set to
+    // the enclosing describe/context group, via describeRspec).
+    const isRubyConcernHook = ctx.lang === "ruby" && (isRailsConcernHookCall(node) || isRspecHookCall(node));
     const callee = isConsumedRClassCall || isRubyConcernHook ? null : calleeName(node, ctx.lang);
     if (callee) {
       const callEdge: RawEdge = {
@@ -1956,7 +1967,77 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
       hashNode: body ?? node,
     };
   }
+  if (node.type === "call") return describeRspec(node, ctx);
   return null;
+}
+
+const RSPEC_GROUP_KEYWORDS = new Set(["describe", "context"]);
+const RSPEC_EXAMPLE_KEYWORDS = new Set(["it", "specify"]);
+
+/**
+ * RSpec's `describe`/`context` blocks aren't inside any real Ruby class —
+ * they're plain method calls whose block is the "body" — so this is the one
+ * definition shape recognized from a `call` node rather than a real
+ * class/module/def grammar construct. Recognized as `kind: "class"` (the
+ * closest existing fit for "a lexical scope containing methods"; no new
+ * `Kind` variant needed), which lets every downstream mechanism (childCtx's
+ * enclosingClass, contains edges, mintId dedup) work for free exactly as it
+ * already does for a real class — `heritageEdges`/`rubyPostHocVisibility`
+ * both degrade to a safe no-op on a `call` node's missing `superclass`/`body`
+ * fields, confirmed directly rather than assumed. `it`/`specify` are
+ * recognized as `kind: "method"` the same way, slugified from their string
+ * description (`rspecSlug`) since there's no identifier to name them with —
+ * `it "is pending"` (no block, a pending example) still gets a node, using
+ * the call itself as `hashNode` (mirrors how `attr_accessor` and a bodyless
+ * definition already fall back to the whole call node elsewhere in this
+ * file). A bare `receiver` of anything other than the constant `RSpec`
+ * disqualifies the match — some other, unrelated method coincidentally named
+ * "describe"/"it" isn't RSpec's DSL.
+ */
+function describeRspec(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return null;
+  const receiver = node.childForFieldName("receiver");
+  const receiverOk = !receiver || (receiver.type === "constant" && receiver.text === "RSpec");
+  if (!receiverOk) return null;
+  if (RSPEC_GROUP_KEYWORDS.has(methodNode.text)) {
+    const block = node.childForFieldName("block");
+    const body = block?.namedChildren.find((c) => c.type === "body_statement");
+    if (!body) return null; // describe/context with no block isn't a group
+    const args = node.childForFieldName("arguments");
+    const firstArg = args?.namedChildren[0];
+    const name =
+      firstArg?.type === "constant"
+        ? firstArg.text
+        : firstArg?.type === "string"
+          ? rspecSlug(firstArg.namedChildren.find((c) => c.type === "string_content")?.text ?? "")
+          : null;
+    if (!name) return null;
+    return { name, kind: "class", headerEnd: body.startIndex, hashNode: body };
+  }
+  if (RSPEC_EXAMPLE_KEYWORDS.has(methodNode.text) && ctx.enclosingClass !== null) {
+    const args = node.childForFieldName("arguments");
+    const descText = args?.namedChildren
+      .find((c) => c.type === "string")
+      ?.namedChildren.find((c) => c.type === "string_content")?.text;
+    const block = node.childForFieldName("block");
+    const body = block?.namedChildren.find((c) => c.type === "body_statement");
+    return { name: rspecSlug(descText ?? ""), kind: "method", headerEnd: (body ?? node).startIndex, hashNode: body ?? node };
+  }
+  return null;
+}
+
+/** A test description → an identifier-safe name: `"#publish"` → `"publish"`,
+ * `"when published"` → `"when_published"`. Falls back to `"example"` for a
+ * description with no alphanumeric content at all (rare). Collisions (two
+ * groups/examples that slugify the same) are handled the same way any other
+ * duplicate name is elsewhere in this file — mintId's `~2`/`~3` suffixing. */
+function rspecSlug(description: string): string {
+  const cleaned = description
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "example";
 }
 
 /**
@@ -2370,6 +2451,45 @@ function isRailsSuppressedMacro(node: Parser.SyntaxNode): boolean {
 }
 
 /**
+ * `let(:name) { ... }` / `let!(:name) { ... }` / `subject { ... }` /
+ * `subject(:name) { ... }` — one method node per call, structurally
+ * identical to `rubySynthesizedMethods`'s `attr_*`/`define_method` handling
+ * (a method-kind node synthesized from a call, its block body walked so
+ * nested calls still resolve) — kept as its own function rather than folded
+ * into that one, since it's an RSpec-specific vocabulary, not plain Ruby.
+ * `subject` with no name defaults to the literal name `subject`, matching
+ * how RSpec itself makes the unnamed subject callable.
+ */
+function rspecSynthesizedMethods(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const isLet = methodNode.text === "let" || methodNode.text === "let!";
+  const isSubject = methodNode.text === "subject";
+  if (!isLet && !isSubject) return [];
+  const block = node.childForFieldName("block");
+  if (!block) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  const name = nameSym ? nameSym.text.slice(1) : isSubject ? "subject" : null;
+  if (!name) return [];
+  return [{ name, hashNode: block, headerEnd: block.startIndex }];
+}
+
+const RSPEC_HOOK_KEYWORDS = new Set(["before", "after", "around"]);
+
+/** `before`/`after`/`around do ... end` (optionally with a `:each`/`:all`/
+ * `:context` scope symbol argument, which doesn't disqualify the match —
+ * only the method name and absence of a receiver matter). No name to
+ * reference elsewhere, so no node is synthesized; see this check's call site
+ * for why it suppresses the callee edge without an early return. */
+function isRspecHookCall(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RSPEC_HOOK_KEYWORDS.has(methodNode.text)) return false;
+  return !node.childForFieldName("receiver");
+}
+
+/**
  * `<expr>.routes.draw do ... end` — recognized structurally (the immediate
  * receiver of `draw` is itself a `.routes` call), not by matching literally
  * "Rails.application" — this also covers a `Rails::Engine` subclass's own
@@ -2593,16 +2713,23 @@ function walkRailsRoutes(node: Parser.SyntaxNode, ctx: WalkCtx, edges: RawEdge[]
  * anywhere an expression is expected (an assignment's right-hand side, a
  * call argument, a `return` value, a binary-operator operand, or a string
  * interpolation)? Restricted to genuine *statement position*: the direct
- * child of a `body_statement` (a method/block body's own statement list).
+ * child of a `body_statement` (a `def`/`do...end` block's own statement
+ * list) OR a `block_body` (a curly-brace `{ }` block's own statement list —
+ * the same role, a different container node type tree-sitter-ruby uses
+ * specifically for that syntax; `let(:post) { helper }`/`scope :x, -> {
+ * helper }` are common enough real-world shapes, especially in RSpec's
+ * `let`/`subject`/example blocks, that this file's own tests caught the gap
+ * twice before it was widened here).
  *
- * Confirmed directly against the grammar (not assumed): only a bare
- * identifier standing alone as its own statement — `def caller; helper; end`
- * — has `body_statement` as its immediate parent. Every other position
- * (`self.x = helper`, `foo(helper)`, `return helper`, `helper + 1`,
- * `"#{helper}"`) nests the identifier one level deeper, inside
+ * Confirmed directly against the grammar (not assumed) for both container
+ * types: only a bare identifier standing alone as its own statement —
+ * `def caller; helper; end` or `-> { helper }` — has `body_statement`/
+ * `block_body` as its immediate parent. Every other position (`self.x =
+ * helper`, `foo(helper)`, `return helper`, `helper + 1`, `"#{helper}"`)
+ * nests the identifier one level deeper, inside
  * `assignment`/`argument_list`/`return`/`binary`/`interpolation` instead —
  * so this one check is narrower AND simpler than enumerating every
- * exclusion (declaration names, assignment targets, parameters, ...) the
+ * exclusion (declaration names, assignment targets, parameters, ...) an
  * earlier version of this function tried to list by hand, and doesn't miss
  * a shape that list-based approach didn't think of. The cost is a
  * false-negative for a call used purely for its return value (`x =
@@ -2611,7 +2738,7 @@ function walkRailsRoutes(node: Parser.SyntaxNode, ctx: WalkCtx, edges: RawEdge[]
  * genuinely ambiguous bare-word shapes.
  */
 function isRubyBareCallCandidate(node: Parser.SyntaxNode): boolean {
-  return node.parent?.type === "body_statement";
+  return node.parent?.type === "body_statement" || node.parent?.type === "block_body";
 }
 
 /** Java definition shapes. Uniform in a way Go's are not: every declaration carries
