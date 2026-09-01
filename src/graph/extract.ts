@@ -850,6 +850,56 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         return;
       }
     }
+    // Rails: ActiveRecord/ActionController macros recognized as call shapes,
+    // the same interception pattern as the plain-Ruby mixin/synthesized-method
+    // checks above — see each helper's own doc comment for the macro family
+    // it covers and why it's modeled the way it is.
+    if (ctx.lang === "ruby" && ctx.enclosingClass !== null) {
+      const association = railsAssociationTarget(node);
+      if (association) {
+        emitRubySynthesizedMethod(
+          { name: association.name, hashNode: node, headerEnd: node.startIndex },
+          ctx,
+          out,
+          edges,
+          minted,
+        );
+        emitRubySynthesizedMethod(
+          { name: `${association.name}=`, hashNode: node, headerEnd: node.startIndex },
+          ctx,
+          out,
+          edges,
+          minted,
+        );
+        if (association.className) {
+          edges.push({ source: ctx.parentId, relation: "references", name: association.className, file: ctx.rel });
+        }
+        return;
+      }
+      const scope = railsScopeTarget(node);
+      if (scope) {
+        emitRubySynthesizedMethod(scope, ctx, out, edges, minted);
+        return;
+      }
+      const delegates = railsDelegateTargets(node);
+      if (delegates.length > 0) {
+        for (const d of delegates) emitRubySynthesizedMethod(d, ctx, out, edges, minted);
+        return;
+      }
+      const callbackTargets = railsCallbackTargets(node);
+      if (callbackTargets.length > 0) {
+        for (const target of callbackTargets) {
+          edges.push({ source: ctx.parentId, relation: "calls", name: target, viaMember: false, file: ctx.rel, kinds: ["method"] });
+        }
+        return;
+      }
+      const rescueTarget = railsRescueFromTarget(node);
+      if (rescueTarget) {
+        edges.push({ source: ctx.parentId, relation: "calls", name: rescueTarget, viaMember: false, file: ctx.rel, kinds: ["method"] });
+        return;
+      }
+      if (isRailsSuppressedMacro(node)) return;
+    }
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
     const isConsumedRClassCall =
       consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
@@ -2091,6 +2141,189 @@ function emitRubySynthesizedMethod(
     };
     for (const child of m.hashNode.namedChildren) walk(child, childCtx, out, edges, minted);
   }
+}
+
+/** A `pair` node's key text, normalized: `hash_key_symbol` (`class_name:`) has
+ * no leading colon in its own text, unlike a `simple_symbol` value (`:foo`) —
+ * this reads the key uniformly regardless of which shape produced the pair. */
+function railsPairKey(pair: Parser.SyntaxNode): string | null {
+  const key = pair.childForFieldName("key");
+  return key?.type === "hash_key_symbol" ? key.text : null;
+}
+
+/** The `simple_symbol` value of a keyword argument pair (`to: :user` → `"user"`),
+ * or null if the pair's value isn't a bare symbol. */
+function railsPairSymbolValue(pair: Parser.SyntaxNode | undefined): string | null {
+  const value = pair?.childForFieldName("value");
+  return value?.type === "simple_symbol" ? value.text.slice(1) : null;
+}
+
+const RAILS_ASSOCIATION_KEYWORDS = new Set(["belongs_to", "has_many", "has_one", "has_and_belongs_to_many"]);
+
+/**
+ * `belongs_to :user`, `has_many :comments`, `has_one :thumbnail`,
+ * `has_and_belongs_to_many :tags` — each generates a reader AND a writer
+ * (`name`/`name=`) at runtime, mirroring `attr_accessor`'s treatment. An
+ * explicit `class_name: "Foo"` option is the only way the association target
+ * is resolved to a `references` edge — inferring it from the symbol name
+ * (`:categories` → `Category`) would need real singularization, which this
+ * file doesn't have and won't guess at (a wrong guess is a false edge; no
+ * edge is just a gap — see this file's "erring toward false negatives"
+ * precedent throughout). Returns null for anything else, including a call
+ * with an explicit receiver (`Foo.belongs_to` isn't an association macro).
+ */
+function railsAssociationTarget(node: Parser.SyntaxNode): { name: string; className: string | null } | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_ASSOCIATION_KEYWORDS.has(methodNode.text)) return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return null;
+  const classNamePair = args?.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "class_name");
+  const classNameValue = classNamePair?.childForFieldName("value");
+  const className =
+    classNameValue?.type === "string"
+      ? (classNameValue.namedChildren.find((c) => c.type === "string_content")?.text ?? null)
+      : null;
+  return { name: nameSym.text.slice(1), className };
+}
+
+/**
+ * `scope :name, -> { ... }` / `scope :name, lambda { ... }` — a class-level
+ * query method, structurally identical to Phase 5's `define_method`
+ * treatment (a method-kind node synthesized from a call, its block body
+ * walked so nested calls still resolve). The second argument is either a
+ * `lambda` node (the `->` literal, `body` field) or an ordinary `call` to
+ * `lambda`/`proc` carrying a `block` field — both grammar shapes confirmed
+ * directly against tree-sitter-ruby, not assumed. Returns null for a `do...end`
+ * multiline lambda's own do_block just as readily as the `{ }` form, since
+ * both are valid `body`/`block` field values.
+ */
+function railsScopeTarget(node: Parser.SyntaxNode): RubySynthesizedMethod | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "scope") return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return null;
+  const bodyCandidate = args?.namedChildren.find((c) => c !== nameSym);
+  let body: Parser.SyntaxNode | null = null;
+  if (bodyCandidate?.type === "lambda") {
+    body = bodyCandidate.childForFieldName("body");
+  } else if (bodyCandidate?.type === "call") {
+    const calleeText = bodyCandidate.childForFieldName("method")?.text;
+    if (calleeText === "lambda" || calleeText === "proc") {
+      body = bodyCandidate.childForFieldName("block") ?? null;
+    }
+  }
+  if (!body) return null;
+  return { name: nameSym.text.slice(1), hashNode: body, headerEnd: body.startIndex };
+}
+
+/**
+ * `delegate :name[, :name2, ...], to: :assoc[, prefix: true | :custom]` —
+ * one reader method per delegated symbol, named per Rails' own prefix rule:
+ * `prefix: true` uses the `to:` target's own name as the prefix
+ * (`delegate :name, to: :user, prefix: true` → `user_name`); `prefix:
+ * :custom` uses that symbol instead; absent/`false` leaves the name bare.
+ * Requires a `to:` pair with a bare-symbol value — `delegate :x, to:
+ * some_method_call` (a dynamic receiver) isn't a shape this file can name
+ * statically, so it's left unrecognized rather than guessed at.
+ */
+function railsDelegateTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "delegate") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  if (!args) return [];
+  const symbols = args.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  if (symbols.length === 0) return [];
+  const pairs = args.namedChildren.filter((c) => c.type === "pair");
+  const toPair = pairs.find((c) => railsPairKey(c) === "to");
+  const toName = railsPairSymbolValue(toPair);
+  if (!toName) return [];
+  const prefixPair = pairs.find((c) => railsPairKey(c) === "prefix");
+  const prefixValue = prefixPair?.childForFieldName("value");
+  const prefix = prefixValue?.type === "true" ? toName : (railsPairSymbolValue(prefixPair) ?? null);
+  return symbols.map((s) => ({
+    name: prefix ? `${prefix}_${s}` : s,
+    hashNode: node,
+    headerEnd: node.startIndex,
+  }));
+}
+
+const RAILS_CALLBACK_KEYWORDS = new Set([
+  "before_save",
+  "after_save",
+  "around_save",
+  "before_create",
+  "after_create",
+  "around_create",
+  "before_update",
+  "after_update",
+  "around_update",
+  "before_destroy",
+  "after_destroy",
+  "around_destroy",
+  "before_validation",
+  "after_validation",
+  "before_action",
+  "after_action",
+  "around_action",
+]);
+
+/**
+ * ActiveRecord lifecycle callbacks (`before_save`/`after_create`/...) and
+ * ActionController filters (`before_action`/`after_action`/`around_action`)
+ * — syntactically identical (`macro_name :method1[, :method2, ...]`), so one
+ * recognizer covers both families. No node is synthesized (the named methods
+ * are ordinary `def`s elsewhere in the class); this only adds the `calls`
+ * edge the runtime dispatch represents, sourced from the class itself (the
+ * declaration is what wires the callback, not any one method) — the same
+ * edge-only shape Phase 4's mixin composition uses for `extends`, here for
+ * `calls` instead.
+ */
+function railsCallbackTargets(node: Parser.SyntaxNode): string[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_CALLBACK_KEYWORDS.has(methodNode.text)) return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  return (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+}
+
+/** `rescue_from SomeError, with: :handler_method` — the same `calls` edge
+ * shape as `railsCallbackTargets`, but the target is the `with:` keyword
+ * pair's value rather than a bare symbol list (rescue_from's own distinct
+ * argument shape). Returns null if there's no `with:` pair with a bare-symbol
+ * value (e.g. `rescue_from(&block)`, which this file doesn't model). */
+function railsRescueFromTarget(node: Parser.SyntaxNode): string | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "rescue_from") return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const withPair = args?.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "with");
+  return railsPairSymbolValue(withPair);
+}
+
+const RAILS_SUPPRESSED_MACROS = new Set(["queue_as", "retry_on", "discard_on"]);
+
+/**
+ * `validates`/`validates_presence_of`/etc., `queue_as`, `retry_on`,
+ * `discard_on` — recognized only to keep them from falling through to the
+ * generic call-edge path as a spurious `calls` edge to a function literally
+ * named e.g. "validates" (the same reasoning Phase 4 already applies to
+ * `include`/`extend`/`prepend`). Deliberately synthesizes nothing: a
+ * validated attribute name usually names a DB column with no corresponding
+ * graph symbol at all, and `retry_on`/`discard_on`'s exception-class argument
+ * and `queue_as`'s queue-name symbol don't reference anything callable
+ * either — there's no node or edge here that wouldn't be a guess.
+ */
+function isRailsSuppressedMacro(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return false;
+  if (node.childForFieldName("receiver")) return false;
+  const name = methodNode.text;
+  return name === "validates" || name.startsWith("validates_") || RAILS_SUPPRESSED_MACROS.has(name);
 }
 
 /**

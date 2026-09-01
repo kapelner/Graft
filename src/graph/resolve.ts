@@ -253,6 +253,15 @@ export function resolveEdges(
         const refKinds: Kind[] = ["class", "interface", "trait", "enum"];
         const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+      } else if (e.file.endsWith(".rb") && byId.get(e.source)?.origin === "ast") {
+        // Rails `belongs_to :x, class_name: "Foo"` — same-file or globally
+        // unique class lookup, no `use`-style import to key off (Ruby has no
+        // import-then-reference two-step for this shape; the class name is
+        // just a bare string literal). Same drop-rather-than-guess contract
+        // as PHP's attribute case above.
+        const refKinds: Kind[] = ["class"];
+        const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
+        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       } else if (e.file.endsWith(".java") && byId.get(e.source)?.origin === "ast") {
         // Java annotation without a specifier (same-file or globally unique
         // `@interface`). Annotation types are `interface` kind — a class of the
