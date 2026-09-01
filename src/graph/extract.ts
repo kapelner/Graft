@@ -836,6 +836,20 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
     // find its public=/private=/active= arguments (there's no other path to
     // them), and it must not ALSO be treated as an ordinary call to a
     // function literally named "R6Class"/"list".
+    // Rails routing DSL: `<expr>.routes.draw do ... end` (Rails.application.routes
+    // or a Rails::Engine subclass's own `.routes`) sits at file top level, never
+    // inside a class — so this check is independent of ctx.enclosingClass, unlike
+    // every other Ruby/Rails interception below. Its content is walked by a
+    // dedicated recursive pass (not the general-purpose `walk()`): a route
+    // declaration isn't a Ruby definition to extract, it's DSL metadata pointing
+    // at a controller#action pair, so no node synthesis applies, only edges. See
+    // walkRailsRoutes's own doc comment for scope and the resolution mechanism.
+    if (ctx.lang === "ruby" && isRailsRoutesDrawCall(node)) {
+      const block = node.childForFieldName("block");
+      const body = block?.namedChildren.find((c) => c.type === "body_statement");
+      if (body) walkRailsRoutes(body, ctx, edges);
+      return;
+    }
     const rubyMixins = ctx.lang === "ruby" && ctx.enclosingClass !== null ? rubyMixinTargets(node) : [];
     if (rubyMixins.length > 0) {
       for (const target of rubyMixins) {
@@ -849,11 +863,142 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         for (const s of synthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
         return;
       }
+      const rspecSynthesized = rspecSynthesizedMethods(node);
+      if (rspecSynthesized.length > 0) {
+        for (const s of rspecSynthesized) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        return;
+      }
+      const sharedTarget = rspecSharedIncludeTarget(node);
+      if (sharedTarget) {
+        edges.push({ source: ctx.parentId, relation: "references", name: sharedTarget, file: ctx.rel });
+        // `it_behaves_like "..." do let(:x) { ... } end` — the optional block
+        // provides dependencies the shared group expects, walked under the
+        // SAME ctx (still the current describe/context group), not a new
+        // scope of its own — mirrors how a shared group's own methods
+        // attribute to it. Manually descended here (rather than relying on
+        // fallthrough) since this branch returns, matching every other
+        // node-or-edge-producing RSpec/Rails interception in this chain.
+        const block = node.childForFieldName("block");
+        const body = block?.namedChildren.find((c) => c.type === "body_statement" || c.type === "block_body");
+        if (body) for (const child of body.namedChildren) walk(child, ctx, out, edges, minted);
+        return;
+      }
+    }
+    // Rails: ActiveRecord/ActionController macros recognized as call shapes,
+    // the same interception pattern as the plain-Ruby mixin/synthesized-method
+    // checks above — see each helper's own doc comment for the macro family
+    // it covers and why it's modeled the way it is.
+    if (ctx.lang === "ruby" && ctx.enclosingClass !== null) {
+      const association = railsAssociationTarget(node);
+      if (association) {
+        emitRubySynthesizedMethod(
+          { name: association.name, hashNode: node, headerEnd: node.startIndex },
+          ctx,
+          out,
+          edges,
+          minted,
+        );
+        emitRubySynthesizedMethod(
+          { name: `${association.name}=`, hashNode: node, headerEnd: node.startIndex },
+          ctx,
+          out,
+          edges,
+          minted,
+        );
+        if (association.className) {
+          edges.push({ source: ctx.parentId, relation: "references", name: association.className, file: ctx.rel });
+        }
+        return;
+      }
+      const scope = railsScopeTarget(node);
+      if (scope) {
+        emitRubySynthesizedMethod(scope, ctx, out, edges, minted);
+        return;
+      }
+      const delegates = railsDelegateTargets(node);
+      if (delegates.length > 0) {
+        for (const d of delegates) emitRubySynthesizedMethod(d, ctx, out, edges, minted);
+        return;
+      }
+      const enumTargets = railsEnumTargets(node);
+      if (enumTargets.length > 0) {
+        for (const e of enumTargets) emitRubySynthesizedMethod(e, ctx, out, edges, minted);
+        return;
+      }
+      const nestedAttrs = railsNestedAttributesTargets(node);
+      if (nestedAttrs.length > 0) {
+        for (const n of nestedAttrs) emitRubySynthesizedMethod(n, ctx, out, edges, minted);
+        return;
+      }
+      const hasSecurePasswordCall = railsHasSecurePasswordTargets(node);
+      if (hasSecurePasswordCall.length > 0) {
+        for (const h of hasSecurePasswordCall) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
+        return;
+      }
+      const attributeTargets = railsAttributeTargets(node);
+      if (attributeTargets.length > 0) {
+        for (const a of attributeTargets) emitRubySynthesizedMethod(a, ctx, out, edges, minted);
+        return;
+      }
+      const encryptsTargets = railsEncryptsTargets(node);
+      if (encryptsTargets.length > 0) {
+        for (const e of encryptsTargets) emitRubySynthesizedMethod(e, ctx, out, edges, minted);
+        return;
+      }
+      const delegatedTypeTargets = railsDelegatedTypeTargets(node);
+      if (delegatedTypeTargets.length > 0) {
+        for (const d of delegatedTypeTargets) emitRubySynthesizedMethod(d, ctx, out, edges, minted);
+        return;
+      }
+      const storeTargets = [...railsStoreAccessorTargets(node), ...railsStoreTargets(node)];
+      if (storeTargets.length > 0) {
+        for (const s of storeTargets) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        return;
+      }
+      const attachedTargets = railsAttachedTargets(node);
+      if (attachedTargets.length > 0) {
+        for (const a of attachedTargets) emitRubySynthesizedMethod(a, ctx, out, edges, minted);
+        return;
+      }
+      const secureTokenCall = railsHasSecureTokenTargets(node);
+      if (secureTokenCall.length > 0) {
+        for (const s of secureTokenCall) emitRubySynthesizedMethod(s, ctx, out, edges, minted);
+        return;
+      }
+      const callbackTargets = [...railsCallbackTargets(node), ...railsHelperMethodTargets(node)];
+      if (callbackTargets.length > 0) {
+        for (const target of callbackTargets) {
+          edges.push({ source: ctx.parentId, relation: "calls", name: target, viaMember: false, file: ctx.rel, kinds: ["method"] });
+        }
+        return;
+      }
+      const rescueTarget = railsRescueFromTarget(node);
+      if (rescueTarget) {
+        edges.push({ source: ctx.parentId, relation: "calls", name: rescueTarget, viaMember: false, file: ctx.rel, kinds: ["method"] });
+        return;
+      }
+      if (isRailsSuppressedMacro(node)) return;
     }
     const consumedCallee = ctx.lang === "r" && node.type === "call" ? rCalleeName(node) : null;
     const isConsumedRClassCall =
       consumedCallee === "R6Class" || (consumedCallee === "list" && rIsMixinContainer(node));
-    const callee = isConsumedRClassCall ? null : calleeName(node, ctx.lang);
+    // `included do ... end` / `class_methods do ... end` — unlike every other
+    // interception above, this one does NOT return early: the do_block's
+    // content (macros, defs) is already reached correctly by the ordinary
+    // trailing recursion below, with ctx.enclosingClass unchanged (still the
+    // concern module) — verified directly, not assumed (see
+    // test/graph-rails-concern.test.ts). Only the callee computation is
+    // suppressed, so the hook call itself doesn't become a spurious `calls`
+    // edge — plausible, not just theoretical, since `def self.included(base)`
+    // is itself a common Ruby override a real codebase might define.
+    // RSpec's before/after/around do...end hooks are the same shape as the
+    // Concern hooks above (a call whose only payload is its block — no name
+    // to reference elsewhere, so no node synthesized) — suppressed the same
+    // way, without an early return, so the hook body still reaches the
+    // ordinary trailing recursion (with ctx.enclosingClass already set to
+    // the enclosing describe/context group, via describeRspec).
+    const isRubyConcernHook = ctx.lang === "ruby" && (isRailsConcernHookCall(node) || isRspecHookCall(node));
+    const callee = isConsumedRClassCall || isRubyConcernHook ? null : calleeName(node, ctx.lang);
     if (callee) {
       const callEdge: RawEdge = {
         source: ctx.parentId,
@@ -902,6 +1047,23 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         edges.push(recvType ? { ...callEdge, recvType } : callEdge);
       }
     }
+  } else if (
+    ctx.lang === "ruby" &&
+    node.type === "identifier" &&
+    isRubyBareCallCandidate(node) &&
+    ctx.enclosingClass !== null &&
+    (node.text === "has_secure_password" || node.text === "has_secure_token")
+  ) {
+    // `has_secure_password`/`has_secure_token` with no explicit
+    // attribute/options is a bare, paren-less, argument-less call — parsed
+    // as a plain `identifier`, same as any other no-args invocation (see
+    // the branch below's own doc comment) — so it needs its own check
+    // here, ahead of the generic bare-call edge push, the same way the
+    // call-node form is intercepted above rather than falling through to
+    // an ordinary `calls` edge.
+    const targets =
+      node.text === "has_secure_password" ? railsHasSecurePasswordTargets(node) : railsHasSecureTokenTargets(node);
+    for (const h of targets) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
   } else if (ctx.lang === "ruby" && node.type === "identifier" && isRubyBareCallCandidate(node)) {
     // Ruby's optional parens mean a paren-less, argument-less method call
     // (`helper`) is syntactically indistinguishable from a local-variable
@@ -1882,7 +2044,78 @@ function describeRuby(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | nu
       hashNode: body ?? node,
     };
   }
+  if (node.type === "call") return describeRspec(node, ctx);
   return null;
+}
+
+const RSPEC_GROUP_KEYWORDS = new Set(["describe", "context", "shared_examples", "shared_examples_for", "shared_context"]);
+const RSPEC_EXAMPLE_KEYWORDS = new Set(["it", "specify"]);
+
+/**
+ * RSpec's `describe`/`context`/`shared_examples`/`shared_examples_for`/
+ * `shared_context` blocks aren't inside any real Ruby class —
+ * they're plain method calls whose block is the "body" — so this is the one
+ * definition shape recognized from a `call` node rather than a real
+ * class/module/def grammar construct. Recognized as `kind: "class"` (the
+ * closest existing fit for "a lexical scope containing methods"; no new
+ * `Kind` variant needed), which lets every downstream mechanism (childCtx's
+ * enclosingClass, contains edges, mintId dedup) work for free exactly as it
+ * already does for a real class — `heritageEdges`/`rubyPostHocVisibility`
+ * both degrade to a safe no-op on a `call` node's missing `superclass`/`body`
+ * fields, confirmed directly rather than assumed. `it`/`specify` are
+ * recognized as `kind: "method"` the same way, slugified from their string
+ * description (`rspecSlug`) since there's no identifier to name them with —
+ * `it "is pending"` (no block, a pending example) still gets a node, using
+ * the call itself as `hashNode` (mirrors how `attr_accessor` and a bodyless
+ * definition already fall back to the whole call node elsewhere in this
+ * file). A bare `receiver` of anything other than the constant `RSpec`
+ * disqualifies the match — some other, unrelated method coincidentally named
+ * "describe"/"it" isn't RSpec's DSL.
+ */
+function describeRspec(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return null;
+  const receiver = node.childForFieldName("receiver");
+  const receiverOk = !receiver || (receiver.type === "constant" && receiver.text === "RSpec");
+  if (!receiverOk) return null;
+  if (RSPEC_GROUP_KEYWORDS.has(methodNode.text)) {
+    const block = node.childForFieldName("block");
+    const body = block?.namedChildren.find((c) => c.type === "body_statement");
+    if (!body) return null; // describe/context with no block isn't a group
+    const args = node.childForFieldName("arguments");
+    const firstArg = args?.namedChildren[0];
+    const name =
+      firstArg?.type === "constant"
+        ? firstArg.text
+        : firstArg?.type === "string"
+          ? rspecSlug(firstArg.namedChildren.find((c) => c.type === "string_content")?.text ?? "")
+          : null;
+    if (!name) return null;
+    return { name, kind: "class", headerEnd: body.startIndex, hashNode: body };
+  }
+  if (RSPEC_EXAMPLE_KEYWORDS.has(methodNode.text) && ctx.enclosingClass !== null) {
+    const args = node.childForFieldName("arguments");
+    const descText = args?.namedChildren
+      .find((c) => c.type === "string")
+      ?.namedChildren.find((c) => c.type === "string_content")?.text;
+    const block = node.childForFieldName("block");
+    const body = block?.namedChildren.find((c) => c.type === "body_statement");
+    return { name: rspecSlug(descText ?? ""), kind: "method", headerEnd: (body ?? node).startIndex, hashNode: body ?? node };
+  }
+  return null;
+}
+
+/** A test description → an identifier-safe name: `"#publish"` → `"publish"`,
+ * `"when published"` → `"when_published"`. Falls back to `"example"` for a
+ * description with no alphanumeric content at all (rare). Collisions (two
+ * groups/examples that slugify the same) are handled the same way any other
+ * duplicate name is elsewhere in this file — mintId's `~2`/`~3` suffixing. */
+function rspecSlug(description: string): string {
+  const cleaned = description
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || "example";
 }
 
 /**
@@ -2093,22 +2326,812 @@ function emitRubySynthesizedMethod(
   }
 }
 
+/** A `pair` node's key text, normalized: `hash_key_symbol` (`class_name:`) has
+ * no leading colon in its own text, unlike a `simple_symbol` value (`:foo`) —
+ * this reads the key uniformly regardless of which shape produced the pair. */
+function railsPairKey(pair: Parser.SyntaxNode): string | null {
+  const key = pair.childForFieldName("key");
+  return key?.type === "hash_key_symbol" ? key.text : null;
+}
+
+/** The `simple_symbol` value of a keyword argument pair (`to: :user` → `"user"`),
+ * or null if the pair's value isn't a bare symbol. */
+function railsPairSymbolValue(pair: Parser.SyntaxNode | undefined): string | null {
+  const value = pair?.childForFieldName("value");
+  return value?.type === "simple_symbol" ? value.text.slice(1) : null;
+}
+
+const RAILS_ASSOCIATION_KEYWORDS = new Set(["belongs_to", "has_many", "has_one", "has_and_belongs_to_many"]);
+
+/**
+ * `belongs_to :user`, `has_many :comments`, `has_one :thumbnail`,
+ * `has_and_belongs_to_many :tags` — each generates a reader AND a writer
+ * (`name`/`name=`) at runtime, mirroring `attr_accessor`'s treatment. An
+ * explicit `class_name: "Foo"` option is the only way the association target
+ * is resolved to a `references` edge — inferring it from the symbol name
+ * (`:categories` → `Category`) would need real singularization, which this
+ * file doesn't have and won't guess at (a wrong guess is a false edge; no
+ * edge is just a gap — see this file's "erring toward false negatives"
+ * precedent throughout). Returns null for anything else, including a call
+ * with an explicit receiver (`Foo.belongs_to` isn't an association macro).
+ */
+function railsAssociationTarget(node: Parser.SyntaxNode): { name: string; className: string | null } | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_ASSOCIATION_KEYWORDS.has(methodNode.text)) return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return null;
+  const classNamePair = args?.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "class_name");
+  const classNameValue = classNamePair?.childForFieldName("value");
+  const className =
+    classNameValue?.type === "string"
+      ? (classNameValue.namedChildren.find((c) => c.type === "string_content")?.text ?? null)
+      : null;
+  return { name: nameSym.text.slice(1), className };
+}
+
+/**
+ * `scope :name, -> { ... }` / `scope :name, lambda { ... }` — a class-level
+ * query method, structurally identical to Phase 5's `define_method`
+ * treatment (a method-kind node synthesized from a call, its block body
+ * walked so nested calls still resolve). The second argument is either a
+ * `lambda` node (the `->` literal, `body` field) or an ordinary `call` to
+ * `lambda`/`proc` carrying a `block` field — both grammar shapes confirmed
+ * directly against tree-sitter-ruby, not assumed. Returns null for a `do...end`
+ * multiline lambda's own do_block just as readily as the `{ }` form, since
+ * both are valid `body`/`block` field values.
+ */
+function railsScopeTarget(node: Parser.SyntaxNode): RubySynthesizedMethod | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "scope") return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return null;
+  const bodyCandidate = args?.namedChildren.find((c) => c !== nameSym);
+  let body: Parser.SyntaxNode | null = null;
+  if (bodyCandidate?.type === "lambda") {
+    body = bodyCandidate.childForFieldName("body");
+  } else if (bodyCandidate?.type === "call") {
+    const calleeText = bodyCandidate.childForFieldName("method")?.text;
+    if (calleeText === "lambda" || calleeText === "proc") {
+      body = bodyCandidate.childForFieldName("block") ?? null;
+    }
+  }
+  if (!body) return null;
+  return { name: nameSym.text.slice(1), hashNode: body, headerEnd: body.startIndex };
+}
+
+/**
+ * `delegate :name[, :name2, ...], to: :assoc[, prefix: true | :custom]` —
+ * one reader method per delegated symbol, named per Rails' own prefix rule:
+ * `prefix: true` uses the `to:` target's own name as the prefix
+ * (`delegate :name, to: :user, prefix: true` → `user_name`); `prefix:
+ * :custom` uses that symbol instead; absent/`false` leaves the name bare.
+ * Requires a `to:` pair with a bare-symbol value — `delegate :x, to:
+ * some_method_call` (a dynamic receiver) isn't a shape this file can name
+ * statically, so it's left unrecognized rather than guessed at.
+ */
+function railsDelegateTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "delegate") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  if (!args) return [];
+  const symbols = args.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  if (symbols.length === 0) return [];
+  const pairs = args.namedChildren.filter((c) => c.type === "pair");
+  const toPair = pairs.find((c) => railsPairKey(c) === "to");
+  const toName = railsPairSymbolValue(toPair);
+  if (!toName) return [];
+  const prefixPair = pairs.find((c) => railsPairKey(c) === "prefix");
+  const prefixValue = prefixPair?.childForFieldName("value");
+  const prefix = prefixValue?.type === "true" ? toName : (railsPairSymbolValue(prefixPair) ?? null);
+  return symbols.map((s) => ({
+    name: prefix ? `${prefix}_${s}` : s,
+    hashNode: node,
+    headerEnd: node.startIndex,
+  }));
+}
+
+/**
+ * `enum status: { active: 0, archived: 1 }` / `enum :status, { active: 0,
+ * archived: 1 }` (Rails 7+ positional form, the mapping as its own second
+ * argument rather than a keyword pair's value) / `enum status: [:active,
+ * :archived]` (array form, implicit indices) — three methods per value: a
+ * predicate (`active?`), a bang (`active!`), and a scope (`Model.active`,
+ * modeled the same as any other synthesized method — this schema doesn't
+ * distinguish instance vs. class methods, same as Phase 2's own singleton-
+ * method precedent).
+ */
+function railsEnumTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "enum") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  if (!args) return [];
+  const pair = args.namedChildren.find((c) => c.type === "pair");
+  const mapping = pair
+    ? pair.childForFieldName("value")
+    : args.namedChildren.find((c) => c.type === "hash" || c.type === "array");
+  if (!mapping) return [];
+  let values: string[];
+  if (mapping.type === "hash") {
+    values = mapping.namedChildren
+      .filter((c) => c.type === "pair")
+      .map((c) => railsPairKey(c))
+      .filter((v): v is string => v !== null);
+  } else if (mapping.type === "array") {
+    values = mapping.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  } else {
+    return [];
+  }
+  const names = values.flatMap((v) => [`${v}?`, `${v}!`, v]);
+  return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
+}
+
+/** `accepts_nested_attributes_for :assoc[, :assoc2, ...]` — one
+ * `<assoc>_attributes=` writer method per symbol, same multi-symbol shape
+ * as `railsCallbackTargets`. */
+function railsNestedAttributesTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "accepts_nested_attributes_for") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const symbols = (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  return symbols.map((s) => ({ name: `${s}_attributes=`, hashNode: node, headerEnd: node.startIndex }));
+}
+
+const RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR = "password";
+
+/**
+ * `has_secure_password` (bare, no parens — the default `:password`
+ * attribute; Ruby's optional-parens/no-args form parses as a plain
+ * `identifier`, not a `call`, so this accepts either node type) or
+ * `has_secure_password(:attr[, validations: false])` — generates a writer,
+ * a confirmation writer, and an `authenticate_<attr>` method; the default
+ * `:password` attribute additionally gets the bare `authenticate` alias
+ * Rails keeps for backward compatibility. `validations:`/other options
+ * don't change which methods are generated, only runtime validation
+ * behavior, so they're not read here.
+ */
+function railsHasSecurePasswordTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  let attr = RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR;
+  if (node.type === "call") {
+    const methodNode = node.childForFieldName("method");
+    if (methodNode?.type !== "identifier" || methodNode.text !== "has_secure_password") return [];
+    if (node.childForFieldName("receiver")) return [];
+    const args = node.childForFieldName("arguments");
+    const attrSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+    if (attrSym) attr = attrSym.text.slice(1);
+  } else if (node.type !== "identifier" || node.text !== "has_secure_password") {
+    return [];
+  }
+  const names = [`${attr}=`, `${attr}_confirmation=`, `authenticate_${attr}`];
+  if (attr === RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR) names.push("authenticate");
+  return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
+}
+
+/** `attribute :title, :string[, default: ...]` (`ActiveModel::Attributes` —
+ * both plain ActiveRecord models and virtual/form-object attributes) — a
+ * reader+writer pair for the FIRST symbol only (the second positional
+ * argument is the type, e.g. `:string`, not a second attribute name — unlike
+ * `encrypts`/`accepts_nested_attributes_for`'s multi-symbol shape below). */
+function railsAttributeTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "attribute") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return [];
+  const name = nameSym.text.slice(1);
+  return [
+    { name, hashNode: node, headerEnd: node.startIndex },
+    { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+  ];
+}
+
+/** `encrypts :ssn[, :name, :email, ...]` (`ActiveRecord::Encryption`) — a
+ * reader+writer pair per symbol; unlike `attribute`, every symbol argument
+ * names its own encrypted attribute (no "first is the name, rest are
+ * options" split — `deterministic:`/other options are always keyword pairs,
+ * never bare symbols, so filtering to `simple_symbol` alone is unambiguous). */
+function railsEncryptsTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "encrypts") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const names = (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  return names.flatMap((name) => [
+    { name, hashNode: node, headerEnd: node.startIndex },
+    { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+  ]);
+}
+
+/** `helper_method :current_user[, :logged_in?, ...]` (ActionController) —
+ * unlike every other macro above, this doesn't generate new methods; it
+ * exposes ALREADY-DEFINED controller methods to views. Modeled as a `calls`
+ * edge from the class to each named method (same shape as
+ * `railsCallbackTargets` — a declaration that wires up a real invocation at
+ * a later point, not a literal call at the declaration site), not a node
+ * synthesis. */
+function railsHelperMethodTargets(node: Parser.SyntaxNode): string[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "helper_method") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  return (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+}
+
+/** `Card` → `card`, `BlogPost` → `blog_post` — the inverse of `railsCamelize`,
+ * approximating Rails' own `String#underscore` (a simple regex, not a full
+ * reimplementation — an acronym-heavy name like `HTMLParser` won't split
+ * perfectly, but that's a rare enough shape that a wrong guess there is an
+ * acceptable cost against getting the common case right; see this file's
+ * usual "erring toward false negatives" precedent for where it draws the
+ * line differently — here a slightly-off name is judged lower-risk than no
+ * predicate method at all, since it doesn't corrupt anything, just names it
+ * imperfectly). */
+function railsUnderscore(camel: string): string {
+  return camel.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/**
+ * `delegated_type :billable, types: %w[Card Note][, primary_key: :uuid]`
+ * (`ActiveRecord::DelegatedType`) — internally calls `belongs_to role, ...,
+ * polymorphic: true` (confirmed directly against the Rails source, not
+ * assumed) plus its own additions, so this synthesizes the FULL set: the
+ * `<role>`/`<role>=` association pair (belongs_to's own contribution),
+ * `<role>_class`/`<role>_types` (fixed names), and one `<type>?` predicate
+ * per entry in the `types:` array — read from a `%w[...]` literal
+ * (`string_array`/`bare_string` node types, distinct from a `["..."]`
+ * double-quoted array, both handled here since either is valid Ruby for
+ * this argument).
+ */
+function railsDelegatedTypeTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "delegated_type") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const roleSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!roleSym) return [];
+  const role = roleSym.text.slice(1);
+  const typesPair = (args?.namedChildren ?? []).find((c) => c.type === "pair" && railsPairKey(c) === "types");
+  const typesValue = typesPair?.childForFieldName("value");
+  const stringContentOf = (n: Parser.SyntaxNode): string | undefined =>
+    n.namedChildren.find((c) => c.type === "string_content")?.text;
+  const typeNames: string[] =
+    typesValue?.type === "string_array"
+      ? typesValue.namedChildren
+          .filter((c) => c.type === "bare_string")
+          .map(stringContentOf)
+          .filter((v): v is string => v !== undefined)
+      : typesValue?.type === "array"
+        ? typesValue.namedChildren
+            .filter((c) => c.type === "string")
+            .map(stringContentOf)
+            .filter((v): v is string => v !== undefined)
+        : [];
+  const names = [role, `${role}=`, `${role}_class`, `${role}_types`, ...typeNames.map((t) => `${railsUnderscore(t)}?`)];
+  return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
+}
+
+/** Rails' own prefix/suffix naming for `store_accessor`/`store`-generated
+ * methods: `true` uses the store attribute's own name, a string/symbol
+ * value is used literally, anything else contributes nothing — confirmed
+ * directly against the Rails source (activerecord/lib/active_record/store.rb),
+ * not assumed. */
+function railsStoreAffix(
+  pairValue: Parser.SyntaxNode | null | undefined,
+  storeAttr: string,
+  side: "prefix" | "suffix",
+): string {
+  let v: string | null = null;
+  if (pairValue?.type === "true") v = storeAttr;
+  else if (pairValue?.type === "simple_symbol") v = pairValue.text.slice(1);
+  else if (pairValue?.type === "string") v = railsStringLiteralValue(pairValue);
+  if (!v) return "";
+  return side === "prefix" ? `${v}_` : `_${v}`;
+}
+
+/** `store_accessor :settings, :color, :size[, prefix:, suffix:]` — the
+ * FIRST symbol is the store attribute itself (skipped, not an accessor
+ * key), every symbol after it is a `<prefix><key><suffix>`/`=` reader+
+ * writer pair. */
+function railsStoreAccessorTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "store_accessor") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  if (!args) return [];
+  const symbols = args.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  const [storeAttr, ...keys] = symbols;
+  if (!storeAttr || keys.length === 0) return [];
+  const pairs = args.namedChildren.filter((c) => c.type === "pair");
+  const prefix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "prefix")?.childForFieldName("value"), storeAttr, "prefix");
+  const suffix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "suffix")?.childForFieldName("value"), storeAttr, "suffix");
+  return keys.flatMap((key) => {
+    const name = `${prefix}${key}${suffix}`;
+    return [
+      { name, hashNode: node, headerEnd: node.startIndex },
+      { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+    ];
+  });
+}
+
+/** `store :settings, accessors: [:color, :size][, prefix:, suffix:]` —
+ * internally calls `store_accessor` with the same `accessors:`/`prefix:`/
+ * `suffix:` options (confirmed directly against the Rails source), so this
+ * reads the exact same shape from an `accessors:` array instead of trailing
+ * positional symbols. No `accessors:` option means `store` only serializes
+ * the column, generating no per-key methods — correctly returns []. */
+function railsStoreTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "store") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const storeAttrSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!storeAttrSym) return [];
+  const storeAttr = storeAttrSym.text.slice(1);
+  const pairs = (args?.namedChildren ?? []).filter((c) => c.type === "pair");
+  const accessorsValue = pairs.find((c) => railsPairKey(c) === "accessors")?.childForFieldName("value");
+  if (accessorsValue?.type !== "array") return [];
+  const keys = accessorsValue.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  const prefix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "prefix")?.childForFieldName("value"), storeAttr, "prefix");
+  const suffix = railsStoreAffix(pairs.find((c) => railsPairKey(c) === "suffix")?.childForFieldName("value"), storeAttr, "suffix");
+  return keys.flatMap((key) => {
+    const name = `${prefix}${key}${suffix}`;
+    return [
+      { name, hashNode: node, headerEnd: node.startIndex },
+      { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+    ];
+  });
+}
+
+const RAILS_ATTACHED_KEYWORDS = new Set(["has_one_attached", "has_many_attached"]);
+
+/** `has_one_attached :avatar` / `has_many_attached :photos[, dependent:
+ * ...]` (`ActiveStorage`) — a reader+writer pair, same shape as
+ * `railsAttachedTargets`'s siblings; the singular/plural distinction (one
+ * attachment vs. a collection) doesn't change which methods are generated,
+ * only their runtime behavior. */
+function railsAttachedTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_ATTACHED_KEYWORDS.has(methodNode.text)) return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return [];
+  const name = nameSym.text.slice(1);
+  return [
+    { name, hashNode: node, headerEnd: node.startIndex },
+    { name: `${name}=`, hashNode: node, headerEnd: node.startIndex },
+  ];
+}
+
+const RAILS_SECURE_TOKEN_DEFAULT_ATTR = "token";
+
+/** `has_secure_token` (bare, no parens — default `:token` attribute, same
+ * dual node-type handling as `railsHasSecurePasswordTargets`) or
+ * `has_secure_token(:attr[, length:, on:, prefix:])` — a single
+ * `regenerate_<attr>` method (confirmed directly against the Rails source:
+ * unlike `has_secure_password`, this macro defines only one new method). */
+function railsHasSecureTokenTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  let attr = RAILS_SECURE_TOKEN_DEFAULT_ATTR;
+  if (node.type === "call") {
+    const methodNode = node.childForFieldName("method");
+    if (methodNode?.type !== "identifier" || methodNode.text !== "has_secure_token") return [];
+    if (node.childForFieldName("receiver")) return [];
+    const args = node.childForFieldName("arguments");
+    const attrSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+    if (attrSym) attr = attrSym.text.slice(1);
+  } else if (node.type !== "identifier" || node.text !== "has_secure_token") {
+    return [];
+  }
+  return [{ name: `regenerate_${attr}`, hashNode: node, headerEnd: node.startIndex }];
+}
+
+const RAILS_CALLBACK_KEYWORDS = new Set([
+  "before_save",
+  "after_save",
+  "around_save",
+  "before_create",
+  "after_create",
+  "around_create",
+  "before_update",
+  "after_update",
+  "around_update",
+  "before_destroy",
+  "after_destroy",
+  "around_destroy",
+  "before_validation",
+  "after_validation",
+  "before_action",
+  "after_action",
+  "around_action",
+]);
+
+/**
+ * ActiveRecord lifecycle callbacks (`before_save`/`after_create`/...) and
+ * ActionController filters (`before_action`/`after_action`/`around_action`)
+ * — syntactically identical (`macro_name :method1[, :method2, ...]`), so one
+ * recognizer covers both families. No node is synthesized (the named methods
+ * are ordinary `def`s elsewhere in the class); this only adds the `calls`
+ * edge the runtime dispatch represents, sourced from the class itself (the
+ * declaration is what wires the callback, not any one method) — the same
+ * edge-only shape Phase 4's mixin composition uses for `extends`, here for
+ * `calls` instead.
+ */
+function railsCallbackTargets(node: Parser.SyntaxNode): string[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_CALLBACK_KEYWORDS.has(methodNode.text)) return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  return (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+}
+
+/** `rescue_from SomeError, with: :handler_method` — the same `calls` edge
+ * shape as `railsCallbackTargets`, but the target is the `with:` keyword
+ * pair's value rather than a bare symbol list (rescue_from's own distinct
+ * argument shape). Returns null if there's no `with:` pair with a bare-symbol
+ * value (e.g. `rescue_from(&block)`, which this file doesn't model). */
+function railsRescueFromTarget(node: Parser.SyntaxNode): string | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "rescue_from") return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const withPair = args?.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "with");
+  return railsPairSymbolValue(withPair);
+}
+
+const RAILS_SUPPRESSED_MACROS = new Set(["queue_as", "retry_on", "discard_on"]);
+
+/**
+ * `validates`/`validates_presence_of`/etc., `queue_as`, `retry_on`,
+ * `discard_on` — recognized only to keep them from falling through to the
+ * generic call-edge path as a spurious `calls` edge to a function literally
+ * named e.g. "validates" (the same reasoning Phase 4 already applies to
+ * `include`/`extend`/`prepend`). Deliberately synthesizes nothing: a
+ * validated attribute name usually names a DB column with no corresponding
+ * graph symbol at all, and `retry_on`/`discard_on`'s exception-class argument
+ * and `queue_as`'s queue-name symbol don't reference anything callable
+ * either — there's no node or edge here that wouldn't be a guess.
+ */
+const RAILS_CONCERN_HOOKS = new Set(["included", "class_methods"]);
+
+/**
+ * `included do ... end` / `class_methods do ... end` — `ActiveSupport::Concern`'s
+ * own hook calls: a bare identifier with no `argument_list` at all (just a
+ * name + a `do_block`), distinguishing them from every other zero-arg call
+ * shape this file recognizes. Only the hook call ITSELF is suppressed here —
+ * unlike this file's other suppression/interception checks, the caller does
+ * NOT return early for this one, since the do_block's content needs the
+ * ordinary trailing recursion to reach it. See the call site's comment for
+ * why no return is correct here specifically.
+ */
+function isRailsConcernHookCall(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RAILS_CONCERN_HOOKS.has(methodNode.text)) return false;
+  if (node.childForFieldName("receiver")) return false;
+  return !node.childForFieldName("arguments");
+}
+
+function isRailsSuppressedMacro(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return false;
+  if (node.childForFieldName("receiver")) return false;
+  const name = methodNode.text;
+  return name === "validates" || name.startsWith("validates_") || RAILS_SUPPRESSED_MACROS.has(name);
+}
+
+/**
+ * `let(:name) { ... }` / `let!(:name) { ... }` / `subject { ... }` /
+ * `subject(:name) { ... }` — one method node per call, structurally
+ * identical to `rubySynthesizedMethods`'s `attr_*`/`define_method` handling
+ * (a method-kind node synthesized from a call, its block body walked so
+ * nested calls still resolve) — kept as its own function rather than folded
+ * into that one, since it's an RSpec-specific vocabulary, not plain Ruby.
+ * `subject` with no name defaults to the literal name `subject`, matching
+ * how RSpec itself makes the unnamed subject callable.
+ */
+function rspecSynthesizedMethods(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const isLet = methodNode.text === "let" || methodNode.text === "let!";
+  const isSubject = methodNode.text === "subject";
+  if (!isLet && !isSubject) return [];
+  const block = node.childForFieldName("block");
+  if (!block) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  const name = nameSym ? nameSym.text.slice(1) : isSubject ? "subject" : null;
+  if (!name) return [];
+  return [{ name, hashNode: block, headerEnd: block.startIndex }];
+}
+
+const RSPEC_HOOK_KEYWORDS = new Set(["before", "after", "around"]);
+
+/** `before`/`after`/`around do ... end` (optionally with a `:each`/`:all`/
+ * `:context` scope symbol argument, which doesn't disqualify the match —
+ * only the method name and absence of a receiver matter). No name to
+ * reference elsewhere, so no node is synthesized; see this check's call site
+ * for why it suppresses the callee edge without an early return. */
+function isRspecHookCall(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RSPEC_HOOK_KEYWORDS.has(methodNode.text)) return false;
+  return !node.childForFieldName("receiver");
+}
+
+const RSPEC_SHARED_INCLUDE_KEYWORDS = new Set([
+  "it_behaves_like",
+  "it_should_behave_like",
+  "include_examples",
+  "include_context",
+]);
+
+/**
+ * `it_behaves_like "a valid model"` / `it_should_behave_like` /
+ * `include_examples` / `include_context` — invokes a `shared_examples`/
+ * `shared_context` group defined elsewhere (possibly a different file), by
+ * name. Slugified the same way `describeRspec` names the group itself
+ * (`rspecSlug`), so the two sides always agree on the target name; resolved
+ * as a `references` edge (kind "class", same resolution path
+ * `railsAssociationTarget`'s `class_name:` edge already uses — this file's
+ * `.rb` branch in resolve.ts's references handling, not new logic).
+ */
+function rspecSharedIncludeTarget(node: Parser.SyntaxNode): string | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || !RSPEC_SHARED_INCLUDE_KEYWORDS.has(methodNode.text)) return null;
+  if (node.childForFieldName("receiver")) return null;
+  const args = node.childForFieldName("arguments");
+  const strNode = args?.namedChildren.find((c) => c.type === "string");
+  const text = strNode?.namedChildren.find((c) => c.type === "string_content")?.text;
+  return text ? rspecSlug(text) : null;
+}
+
+/**
+ * `<expr>.routes.draw do ... end` — recognized structurally (the immediate
+ * receiver of `draw` is itself a `.routes` call), not by matching literally
+ * "Rails.application" — this also covers a `Rails::Engine` subclass's own
+ * `SomeEngine::Engine.routes.draw`, the same shape with a different receiver
+ * chain underneath `.routes`.
+ */
+function isRailsRoutesDrawCall(node: Parser.SyntaxNode): boolean {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "draw") return false;
+  const receiver = node.childForFieldName("receiver");
+  if (receiver?.type !== "call") return false;
+  return receiver.childForFieldName("method")?.text === "routes";
+}
+
+/** `"controller#action"` (or namespaced `"admin/users#index"`, `/`-separated
+ * module segments) → `{ controller: "Admin::UsersController", action: "index" }`.
+ * Null if there's no `#`, or either half is empty. */
+function railsControllerActionFromString(text: string): { controller: string; action: string } | null {
+  const hashIdx = text.indexOf("#");
+  if (hashIdx === -1) return null;
+  const controllerPart = text.slice(0, hashIdx);
+  const action = text.slice(hashIdx + 1);
+  if (!controllerPart || !action) return null;
+  const segments = controllerPart.split("/").filter(Boolean);
+  if (segments.length === 0) return null;
+  const controller = segments
+    .map((s, i) => (i === segments.length - 1 ? `${railsCamelize(s)}Controller` : railsCamelize(s)))
+    .join("::");
+  return { controller, action };
+}
+
+/** `posts` → `Posts`, `blog_posts` → `BlogPosts` — Rails' own deterministic
+ * naming convention (a plural/singular symbol camelized verbatim, NO
+ * singularization guessing), the same reasoning `railsAssociationTarget`'s
+ * doc comment explains for why singularizing `:categories` isn't attempted. */
+function railsCamelize(snakeCase: string): string {
+  return snakeCase
+    .split("_")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join("");
+}
+
+function railsStringLiteralValue(node: Parser.SyntaxNode | null | undefined): string | null {
+  if (node?.type !== "string") return null;
+  return node.namedChildren.find((c) => c.type === "string_content")?.text ?? null;
+}
+
+const RAILS_ROUTE_VERBS = new Set(["get", "post", "put", "patch", "delete"]);
+
+/**
+ * `get/post/put/patch/delete "/path", to: "controller#action"` and
+ * `root "controller#action"` / `root to: "controller#action"`. A verb's
+ * target is read ONLY from an explicit `to:` pair — a bare positional string
+ * is always the path (position 0), never the target, so it's never
+ * mistaken for one. `root` is the one exception: a single positional string
+ * with no `to:` at all IS the target (root's own path is always implicit
+ * "/", so there's no path argument to collide with).
+ */
+function railsRouteTarget(node: Parser.SyntaxNode): { controller: string; action: string } | null {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier") return null;
+  if (node.childForFieldName("receiver")) return null;
+  const isRoot = methodNode.text === "root";
+  if (!RAILS_ROUTE_VERBS.has(methodNode.text) && !isRoot) return null;
+  const args = node.childForFieldName("arguments");
+  if (!args) return null;
+  const toPair = args.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "to");
+  const toText = railsStringLiteralValue(toPair?.childForFieldName("value"));
+  if (toText) return railsControllerActionFromString(toText);
+  if (isRoot) {
+    const bareText = railsStringLiteralValue(args.namedChildren.find((c) => c.type === "string"));
+    if (bareText) return railsControllerActionFromString(bareText);
+  }
+  return null;
+}
+
+const RAILS_RESOURCES_DEFAULT_ACTIONS = ["index", "create", "new", "edit", "show", "update", "destroy"];
+const RAILS_RESOURCE_SINGULAR_DEFAULT_ACTIONS = ["create", "new", "edit", "show", "update", "destroy"];
+
+/**
+ * `resources :posts[, only:/except:/controller: ...]` (plural, RESTful
+ * collection — no `index` for the singular `resource` form, which has no
+ * collection to list). `only:`/`except:` narrow the 7/6 conventional
+ * actions, each taking either a bare symbol or a symbol array. `controller:`
+ * overrides which symbol names the controller, still camelized the same
+ * deterministic way. Nested `do ... end` blocks (`member`/`collection`
+ * sub-routes) are deliberately unhandled — out of scope for this pass, see
+ * the design note in the Rails routing test file.
+ */
+function railsResourcesTargets(node: Parser.SyntaxNode): { controller: string; action: string }[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || (methodNode.text !== "resources" && methodNode.text !== "resource")) return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const nameSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+  if (!nameSym) return [];
+  const pairs = (args?.namedChildren ?? []).filter((c) => c.type === "pair");
+  const controllerOverride = railsStringLiteralValue(
+    pairs.find((c) => railsPairKey(c) === "controller")?.childForFieldName("value"),
+  );
+  const controller = `${railsCamelize(controllerOverride ?? nameSym.text.slice(1))}Controller`;
+  const defaultActions =
+    methodNode.text === "resources" ? RAILS_RESOURCES_DEFAULT_ACTIONS : RAILS_RESOURCE_SINGULAR_DEFAULT_ACTIONS;
+  const symbolsOf = (pair: Parser.SyntaxNode | undefined): string[] | null => {
+    const value = pair?.childForFieldName("value");
+    if (value?.type === "simple_symbol") return [value.text.slice(1)];
+    if (value?.type === "array") return value.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+    return null;
+  };
+  const only = symbolsOf(pairs.find((c) => railsPairKey(c) === "only"));
+  const except = symbolsOf(pairs.find((c) => railsPairKey(c) === "except"));
+  let actions = only ?? defaultActions;
+  if (except) actions = actions.filter((a) => !except.includes(a));
+  // member/collection routes are additive custom actions, unaffected by
+  // only:/except: (those narrow only the 7/6 CONVENTIONAL CRUD actions).
+  actions = [...actions, ...railsResourcesBlockActions(node)];
+  return actions.map((action) => ({ controller, action }));
+}
+
+/** The verb calls (`get :publish`, `post :archive`, ...) directly inside a
+ * `member do ... end` / `collection do ... end` block — the symbol is the
+ * action name itself, not a path (contrast top-level routes, where `get`'s
+ * first argument is always a path string). */
+function railsMemberCollectionActionSymbols(doBlockBody: Parser.SyntaxNode): string[] {
+  const actions: string[] = [];
+  for (const child of doBlockBody.namedChildren) {
+    if (child.type !== "call") continue;
+    const methodNode = child.childForFieldName("method");
+    if (methodNode?.type !== "identifier" || !RAILS_ROUTE_VERBS.has(methodNode.text)) continue;
+    const args = child.childForFieldName("arguments");
+    const actionSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+    if (actionSym) actions.push(actionSym.text.slice(1));
+  }
+  return actions;
+}
+
+/**
+ * `resources :posts do member do ... end; collection do ... end end` and the
+ * inline `get :publish, on: :member` form — both name additional actions on
+ * the SAME controller the enclosing `resources` already resolved: member/
+ * collection only affect the generated PATH (`/posts/:id/publish` vs.
+ * `/posts/search`), never which controller handles it, so both forms are
+ * read identically here. A nested `resources` inside this block (genuinely
+ * nested routes, e.g. `resources :posts do resources :comments end`) is
+ * deliberately unhandled — a different controller entirely, out of scope
+ * for this pass, same "erring toward false negatives" precedent as
+ * elsewhere in this file.
+ */
+function railsResourcesBlockActions(node: Parser.SyntaxNode): string[] {
+  const block = node.childForFieldName("block");
+  const body = block?.namedChildren.find((c) => c.type === "body_statement");
+  if (!body) return [];
+  const actions: string[] = [];
+  for (const child of body.namedChildren) {
+    if (child.type !== "call") continue;
+    const methodNode = child.childForFieldName("method");
+    if (methodNode?.type !== "identifier") continue;
+    if (methodNode.text === "member" || methodNode.text === "collection") {
+      const innerBlock = child.childForFieldName("block");
+      const innerBody = innerBlock?.namedChildren.find((c) => c.type === "body_statement");
+      if (innerBody) actions.push(...railsMemberCollectionActionSymbols(innerBody));
+      continue;
+    }
+    if (RAILS_ROUTE_VERBS.has(methodNode.text)) {
+      const args = child.childForFieldName("arguments");
+      const onPair = args?.namedChildren.find((c) => c.type === "pair" && railsPairKey(c) === "on");
+      const onValue = railsPairSymbolValue(onPair);
+      if (onValue === "member" || onValue === "collection") {
+        const actionSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+        if (actionSym) actions.push(actionSym.text.slice(1));
+      }
+    }
+  }
+  return actions;
+}
+
+/**
+ * Recursive descent over a routes-DSL body (the `draw do...end` block's own
+ * body_statement, or a nested `namespace do...end`'s) — NOT `walk()`, since
+ * nothing here is a Ruby definition to extract, only edges pointing at
+ * controller actions. `namespace :admin do ... end` is recursed into so its
+ * nested routes are still reached, but deliberately does NOT qualify the
+ * resolved controller name (`Admin::UsersController`) — `NodeV1.owner` (what
+ * `resolveTypedMember` actually keys `recvType` lookups against) is always a
+ * class's bare name, never namespace-qualified, even for a class nested in a
+ * module; a qualified `recvType` would silently never match anything. Every
+ * recognized route (verb/root/resources) becomes a `calls` edge shaped
+ * exactly like a typed member call (`viaMember: true, recvType:
+ * "<Controller>"`) — reusing resolve.ts's existing typed-member resolution
+ * (the same path `self.method`/`Klass.method` dispatch already goes through)
+ * rather than inventing route-specific resolution logic; if two same-named
+ * controllers exist in different namespaces/files, resolveTypedMember's
+ * existing same-file-tiebreak-else-ambiguous-drop rule applies, same as any
+ * other typed call. `source` is `ctx.parentId`, which at file top level
+ * (routes.rb has no enclosing class) is the file's own node id.
+ */
+function walkRailsRoutes(node: Parser.SyntaxNode, ctx: WalkCtx, edges: RawEdge[]): void {
+  for (const child of node.namedChildren) {
+    if (child.type !== "call") continue;
+    const methodNode = child.childForFieldName("method");
+    if (methodNode?.type === "identifier" && methodNode.text === "namespace" && !child.childForFieldName("receiver")) {
+      const block = child.childForFieldName("block");
+      const body = block?.namedChildren.find((c) => c.type === "body_statement");
+      if (body) walkRailsRoutes(body, ctx, edges);
+      continue;
+    }
+    const targets: { controller: string; action: string }[] = [];
+    const route = railsRouteTarget(child);
+    if (route) targets.push(route);
+    targets.push(...railsResourcesTargets(child));
+    for (const t of targets) {
+      edges.push({ source: ctx.parentId, relation: "calls", name: t.action, viaMember: true, recvType: t.controller, file: ctx.rel });
+    }
+  }
+}
+
 /**
  * Does this bare `identifier` look like a paren-less, standalone method
  * invocation — as opposed to a local-variable/parameter read appearing
  * anywhere an expression is expected (an assignment's right-hand side, a
  * call argument, a `return` value, a binary-operator operand, or a string
  * interpolation)? Restricted to genuine *statement position*: the direct
- * child of a `body_statement` (a method/block body's own statement list).
+ * child of a `body_statement` (a `def`/`do...end` block's own statement
+ * list) OR a `block_body` (a curly-brace `{ }` block's own statement list —
+ * the same role, a different container node type tree-sitter-ruby uses
+ * specifically for that syntax; `let(:post) { helper }`/`scope :x, -> {
+ * helper }` are common enough real-world shapes, especially in RSpec's
+ * `let`/`subject`/example blocks, that this file's own tests caught the gap
+ * twice before it was widened here).
  *
- * Confirmed directly against the grammar (not assumed): only a bare
- * identifier standing alone as its own statement — `def caller; helper; end`
- * — has `body_statement` as its immediate parent. Every other position
- * (`self.x = helper`, `foo(helper)`, `return helper`, `helper + 1`,
- * `"#{helper}"`) nests the identifier one level deeper, inside
+ * Confirmed directly against the grammar (not assumed) for both container
+ * types: only a bare identifier standing alone as its own statement —
+ * `def caller; helper; end` or `-> { helper }` — has `body_statement`/
+ * `block_body` as its immediate parent. Every other position (`self.x =
+ * helper`, `foo(helper)`, `return helper`, `helper + 1`, `"#{helper}"`)
+ * nests the identifier one level deeper, inside
  * `assignment`/`argument_list`/`return`/`binary`/`interpolation` instead —
  * so this one check is narrower AND simpler than enumerating every
- * exclusion (declaration names, assignment targets, parameters, ...) the
+ * exclusion (declaration names, assignment targets, parameters, ...) an
  * earlier version of this function tried to list by hand, and doesn't miss
  * a shape that list-based approach didn't think of. The cost is a
  * false-negative for a call used purely for its return value (`x =
@@ -2117,7 +3140,7 @@ function emitRubySynthesizedMethod(
  * genuinely ambiguous bare-word shapes.
  */
 function isRubyBareCallCandidate(node: Parser.SyntaxNode): boolean {
-  return node.parent?.type === "body_statement";
+  return node.parent?.type === "body_statement" || node.parent?.type === "block_body";
 }
 
 /** Java definition shapes. Uniform in a way Go's are not: every declaration carries

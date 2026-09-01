@@ -205,7 +205,10 @@ compiler-grade layer — all `$0` and deterministic (no model, no key):
   `library()`/`source()` imports), **Ruby** (`.rb` — classes, modules,
   instance/singleton methods, private/protected/public visibility,
   include/extend/prepend mixin composition, attr_accessor/reader/writer and
-  define_method synthesis).
+  define_method synthesis — plus Rails and RSpec macro recognition:
+  ActiveRecord/ActionController macros, `ActiveSupport::Concern`, the routing
+  DSL, and RSpec's `describe`/`it`/`let`/`shared_examples`, each grounded
+  against the real `rails/rails` source rather than guessed).
 
 - **Broad** — symbols (functions, classes, methods, types, …) plus name-resolved
   call edges via a generic tree-sitter extractor, one grammar per language:
