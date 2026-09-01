@@ -905,6 +905,21 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         for (const d of delegates) emitRubySynthesizedMethod(d, ctx, out, edges, minted);
         return;
       }
+      const enumTargets = railsEnumTargets(node);
+      if (enumTargets.length > 0) {
+        for (const e of enumTargets) emitRubySynthesizedMethod(e, ctx, out, edges, minted);
+        return;
+      }
+      const nestedAttrs = railsNestedAttributesTargets(node);
+      if (nestedAttrs.length > 0) {
+        for (const n of nestedAttrs) emitRubySynthesizedMethod(n, ctx, out, edges, minted);
+        return;
+      }
+      const hasSecurePasswordCall = railsHasSecurePasswordTargets(node);
+      if (hasSecurePasswordCall.length > 0) {
+        for (const h of hasSecurePasswordCall) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
+        return;
+      }
       const callbackTargets = railsCallbackTargets(node);
       if (callbackTargets.length > 0) {
         for (const target of callbackTargets) {
@@ -987,6 +1002,20 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
         edges.push(recvType ? { ...callEdge, recvType } : callEdge);
       }
     }
+  } else if (
+    ctx.lang === "ruby" &&
+    node.type === "identifier" &&
+    isRubyBareCallCandidate(node) &&
+    ctx.enclosingClass !== null &&
+    node.text === "has_secure_password"
+  ) {
+    // `has_secure_password` with no explicit attribute/options is a bare,
+    // paren-less, argument-less call — parsed as a plain `identifier`, same
+    // as any other no-args invocation (see the branch below's own doc
+    // comment) — so it needs its own check here, ahead of the generic
+    // bare-call edge push, the same way the call-node form is intercepted
+    // above rather than falling through to an ordinary `calls` edge.
+    for (const h of railsHasSecurePasswordTargets(node)) emitRubySynthesizedMethod(h, ctx, out, edges, minted);
   } else if (ctx.lang === "ruby" && node.type === "identifier" && isRubyBareCallCandidate(node)) {
     // Ruby's optional parens mean a paren-less, argument-less method call
     // (`helper`) is syntactically indistinguishable from a local-variable
@@ -2355,6 +2384,84 @@ function railsDelegateTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] 
     hashNode: node,
     headerEnd: node.startIndex,
   }));
+}
+
+/**
+ * `enum status: { active: 0, archived: 1 }` / `enum :status, { active: 0,
+ * archived: 1 }` (Rails 7+ positional form, the mapping as its own second
+ * argument rather than a keyword pair's value) / `enum status: [:active,
+ * :archived]` (array form, implicit indices) — three methods per value: a
+ * predicate (`active?`), a bang (`active!`), and a scope (`Model.active`,
+ * modeled the same as any other synthesized method — this schema doesn't
+ * distinguish instance vs. class methods, same as Phase 2's own singleton-
+ * method precedent).
+ */
+function railsEnumTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "enum") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  if (!args) return [];
+  const pair = args.namedChildren.find((c) => c.type === "pair");
+  const mapping = pair
+    ? pair.childForFieldName("value")
+    : args.namedChildren.find((c) => c.type === "hash" || c.type === "array");
+  if (!mapping) return [];
+  let values: string[];
+  if (mapping.type === "hash") {
+    values = mapping.namedChildren
+      .filter((c) => c.type === "pair")
+      .map((c) => railsPairKey(c))
+      .filter((v): v is string => v !== null);
+  } else if (mapping.type === "array") {
+    values = mapping.namedChildren.filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  } else {
+    return [];
+  }
+  const names = values.flatMap((v) => [`${v}?`, `${v}!`, v]);
+  return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
+}
+
+/** `accepts_nested_attributes_for :assoc[, :assoc2, ...]` — one
+ * `<assoc>_attributes=` writer method per symbol, same multi-symbol shape
+ * as `railsCallbackTargets`. */
+function railsNestedAttributesTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  const methodNode = node.childForFieldName("method");
+  if (methodNode?.type !== "identifier" || methodNode.text !== "accepts_nested_attributes_for") return [];
+  if (node.childForFieldName("receiver")) return [];
+  const args = node.childForFieldName("arguments");
+  const symbols = (args?.namedChildren ?? []).filter((c) => c.type === "simple_symbol").map((c) => c.text.slice(1));
+  return symbols.map((s) => ({ name: `${s}_attributes=`, hashNode: node, headerEnd: node.startIndex }));
+}
+
+const RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR = "password";
+
+/**
+ * `has_secure_password` (bare, no parens — the default `:password`
+ * attribute; Ruby's optional-parens/no-args form parses as a plain
+ * `identifier`, not a `call`, so this accepts either node type) or
+ * `has_secure_password(:attr[, validations: false])` — generates a writer,
+ * a confirmation writer, and an `authenticate_<attr>` method; the default
+ * `:password` attribute additionally gets the bare `authenticate` alias
+ * Rails keeps for backward compatibility. `validations:`/other options
+ * don't change which methods are generated, only runtime validation
+ * behavior, so they're not read here.
+ */
+function railsHasSecurePasswordTargets(node: Parser.SyntaxNode): RubySynthesizedMethod[] {
+  let attr = RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR;
+  if (node.type === "call") {
+    const methodNode = node.childForFieldName("method");
+    if (methodNode?.type !== "identifier" || methodNode.text !== "has_secure_password") return [];
+    if (node.childForFieldName("receiver")) return [];
+    const args = node.childForFieldName("arguments");
+    const attrSym = args?.namedChildren.find((c) => c.type === "simple_symbol");
+    if (attrSym) attr = attrSym.text.slice(1);
+  } else if (node.type !== "identifier" || node.text !== "has_secure_password") {
+    return [];
+  }
+  const names = [`${attr}=`, `${attr}_confirmation=`, `authenticate_${attr}`];
+  if (attr === RAILS_HAS_SECURE_PASSWORD_DEFAULT_ATTR) names.push("authenticate");
+  return names.map((name) => ({ name, hashNode: node, headerEnd: node.startIndex }));
 }
 
 const RAILS_CALLBACK_KEYWORDS = new Set([
